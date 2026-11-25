@@ -93,6 +93,7 @@ F_DEL = BASE / "deleted_accounts.csv"  # tài khoản đã bị admin xóa (đ�
 F_SES = BASE / "sessions.csv"  # phiên đăng nhập ghi nhớ (chỉ lưu mã băm của token)
 
 LAP_COLS = ["id", "sku", "name", "brand", "price", "cpu", "ram", "gpu", "ssd", "screen", "os", "image", "description"]
+# facebook_id được giữ nguyên vì schema Supabase hiện tại chưa có github_id; GitHub IDs lưu dạng "github:<id>".
 USR_COLS = ["username", "password", "fullname", "role", "email", "google_id", "facebook_id", "balance", "status", "phone", "support_hours", "terms_at"]
 NO_PASSWORD = "!"
 ORD_COLS = ["username", "laptop_id", "date"]
@@ -511,7 +512,7 @@ def reset_filters() -> None:
 
 
 # =====================================================
-# 4b. ĐĂNG NHẬP / ĐĂNG KÝ / LIÊN KẾT BẰNG GOOGLE & FACEBOOK (OAuth 2.0)
+# 4b. ĐĂNG NHẬP / ĐĂNG KÝ / LIÊN KẾT BẰNG GOOGLE & GITHUB (OAuth 2.0)
 # =====================================================
 PROVIDERS = {
     "google": {
@@ -531,18 +532,21 @@ PROVIDERS = {
             '<path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>'
         ),
     },
-    "facebook": {
-        "label": "Facebook",
-        "id_key": "FACEBOOK_APP_ID",
-        "secret_key": "FACEBOOK_APP_SECRET",
+    "github": {
+        "label": "GitHub",
+        "id_key": "GITHUB_CLIENT_ID",
+        "secret_key": "GITHUB_CLIENT_SECRET",
+        # Giữ cột facebook_id để không phải thay đổi schema Supabase.
+        # Giá trị GitHub được lưu có tiền tố "github:" để không va chạm ID Facebook cũ.
         "col": "facebook_id",
-        "auth_url": "https://www.facebook.com/v21.0/dialog/oauth",
-        "token_url": "https://graph.facebook.com/v21.0/oauth/access_token",
-        "profile_url": "https://graph.facebook.com/v21.0/me",
-        "scope": "email,public_profile",
+        "auth_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "profile_url": "https://api.github.com/user",
+        "emails_url": "https://api.github.com/user/emails",
+        "scope": "read:user user:email",
         "icon": (
             '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">'
-            '<path fill="#fff" d="M24 12.07C24 5.4 18.63 0 12 0S0 5.4 0 12.07C0 18.1 4.39 23.1 10.13 24v-8.44H7.08v-3.49h3.05V9.41c0-3.02 1.79-4.69 4.53-4.69 1.31 0 2.68.24 2.68.24v2.97h-1.51c-1.49 0-1.96.93-1.96 1.88v2.26h3.33l-.53 3.49h-2.8V24C19.61 23.1 24 18.1 24 12.07z"/></svg>'
+            '<path fill="currentColor" d="M12 .297a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.23c-3.34.72-4.04-1.42-4.04-1.42-.55-1.39-1.33-1.76-1.33-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.49 1 .11-.78.42-1.3.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.48 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.22.69.83.58A12 12 0 0 0 12 .297z"/></svg>'
         ),
     },
 }
@@ -568,7 +572,7 @@ def _random_state_key() -> bytes:
 
 
 def _state_key() -> bytes:
-    seed = cfg("AUTH_STATE_SECRET") or (cfg("GOOGLE_CLIENT_SECRET") + cfg("FACEBOOK_APP_SECRET"))
+    seed = cfg("AUTH_STATE_SECRET") or (cfg("GOOGLE_CLIENT_SECRET") + cfg("GITHUB_CLIENT_SECRET"))
     return seed.encode("utf-8") if seed else _random_state_key()
 
 
@@ -585,7 +589,7 @@ def demo_mode() -> bool:
 
 
 def _cart_snapshot() -> dict[str, int]:
-    """Giỏ hàng hiện tại (gọn) để đi kèm tham số state, vì chuyển hướng sang Google/Facebook sẽ tạo phiên mới."""
+    """Giỏ hàng hiện tại (gọn) để đi kèm tham số state, vì chuyển hướng sang Google/GitHub sẽ tạo phiên mới."""
     try:
         return {str(int(k)): max(1, min(int(v), 99)) for k, v in list(ss.cart.items())[:30]}
     except Exception:
@@ -640,11 +644,12 @@ def build_auth_url(provider: str, link_user: str = "") -> str:
 
 
 class OAuthError(Exception):
-    """Lỗi do Google/Facebook trả về, kèm thông điệp thân thiện để hiện cho người dùng."""
+    """Lỗi do Google/GitHub trả về, kèm thông điệp thân thiện để hiện cho người dùng."""
 
 
 _OAUTH_HINTS = {
     "invalid_grant": "mã xác thực đã dùng hoặc hết hạn, hãy bấm đăng nhập lại.",
+    "bad_verification_code": "mã đăng nhập GitHub đã hết hạn hoặc đã được sử dụng; hãy thử lại.",
     "invalid_client": "Client ID / Client Secret không đúng, hãy kiểm tra lại secrets.toml.",
     "unauthorized_client": "ứng dụng chưa được phép dùng luồng đăng nhập này.",
     "access_denied": "bạn (hoặc tài khoản kiểm thử) chưa được cấp quyền truy cập ứng dụng.",
@@ -661,7 +666,7 @@ def _oauth_json(resp, label: str) -> dict:
     if resp.ok and "error" not in body:
         return body
     err = body.get("error", "")
-    if isinstance(err, dict):  # Facebook: {"error": {"message", "code", ...}}
+    if isinstance(err, dict):  # OAuth provider: {"error": {"message", "code", ...}}
         code, detail = str(err.get("code", "")), str(err.get("message", ""))
     else:  # Google: {"error": "...", "error_description": "..."}
         code, detail = str(err), str(body.get("error_description", ""))
@@ -677,6 +682,7 @@ def fetch_profile(provider: str, code: str) -> dict:
     p = PROVIDERS[provider]
     label = p["label"]
     cid, secret = cfg(p["id_key"]), cfg(p["secret_key"])
+
     if provider == "google":
         tok = _oauth_json(
             requests.post(
@@ -688,16 +694,69 @@ def fetch_profile(provider: str, code: str) -> dict:
         )
         d = _oauth_json(requests.get(p["profile_url"], headers={"Authorization": f"Bearer {tok['access_token']}"}, timeout=10), label)
         return {"id": str(d["sub"]), "email": d.get("email", ""), "name": d.get("name", ""), "verified": bool(d.get("email_verified"))}
-    tok = _oauth_json(
-        requests.get(
-            p["token_url"],
-            params={"client_id": cid, "client_secret": secret, "redirect_uri": app_url(), "code": code},
-            timeout=10,
-        ),
-        label,
-    )
-    d = _oauth_json(requests.get(p["profile_url"], params={"fields": "id,name,email", "access_token": tok["access_token"]}, timeout=10), label)
-    return {"id": str(d["id"]), "email": d.get("email", ""), "name": d.get("name", ""), "verified": bool(d.get("email"))}
+
+    if provider == "github":
+        # GitHub OAuth Web Flow: POST authorization code để nhận access token.
+        tok = _oauth_json(
+            requests.post(
+                p["token_url"],
+                data={
+                    "client_id": cid,
+                    "client_secret": secret,
+                    "code": code,
+                    "redirect_uri": app_url(),
+                },
+                headers={"Accept": "application/json"},
+                timeout=10,
+            ),
+            label,
+        )
+        access_token = tok.get("access_token")
+        if not access_token:
+            raise OAuthError("GitHub không trả về access token. Hãy kiểm tra OAuth App và thử đăng nhập lại.")
+
+        gh_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2026-03-10",
+        }
+        profile_resp = requests.get(p["profile_url"], headers=gh_headers, timeout=10)
+        profile = _oauth_json(profile_resp, label)
+
+        # Email có thể bị ẩn ở hồ sơ công khai; lấy email đã xác minh qua user:email.
+        email = ""
+        verified = False
+        try:
+            email_resp = requests.get(p["emails_url"], headers=gh_headers, timeout=10)
+            if email_resp.ok:
+                email_items = email_resp.json()
+                if isinstance(email_items, list):
+                    chosen = next(
+                        (item for item in email_items if item.get("primary") and item.get("verified")),
+                        None,
+                    )
+                    if chosen is None:
+                        chosen = next((item for item in email_items if item.get("verified")), None)
+                    if chosen:
+                        email = str(chosen.get("email") or "")
+                        verified = bool(email)
+        except (ValueError, TypeError, requests.RequestException):
+            # Không có quyền đọc email hoặc API email tạm lỗi: vẫn có thể đăng nhập bằng GitHub ID.
+            pass
+
+        if not email:
+            # Email công khai chỉ dùng hiển thị/lưu hồ sơ, không dùng tự động ghép tài khoản.
+            email = str(profile.get("email") or "")
+
+        github_name = profile.get("name") or profile.get("login") or "GitHub user"
+        return {
+            "id": str(profile["id"]),
+            "email": email,
+            "name": str(github_name),
+            "verified": verified,
+        }
+
+    raise OAuthError(f"Nhà cung cấp đăng nhập không được hỗ trợ: {provider}.")
 
 
 def _ascii_slug(text: str) -> str:
@@ -726,7 +785,8 @@ def process_social_profile(provider: str, prof: dict, link_user: str = "") -> bo
     meta = PROVIDERS[provider]
     col, label = meta["col"], meta["label"]
     df = read_csv(F_USR, USR_COLS)
-    pid = str(prof["id"])
+    raw_pid = str(prof["id"])
+    pid = f"github:{raw_pid}" if provider == "github" else raw_pid
     email = (prof.get("email") or "").strip().lower()
     name = (prof.get("name") or "").strip()
     owner = df[df[col] == pid]
@@ -753,7 +813,7 @@ def process_social_profile(provider: str, prof: dict, link_user: str = "") -> bo
         flash(f"Chào mừng {row['fullname']}!", "👋")
         return True
 
-    tomb = find_tombstone(google_id=pid if provider == "google" else "", facebook_id=pid if provider == "facebook" else "")
+    tomb = find_tombstone(google_id=pid if provider == "google" else "", facebook_id=pid if provider == "github" else "")
     if tomb is not None:
         ss.violation = violation_msg(tomb)
         flash("Tài khoản này đã bị xóa do vi phạm thỏa thuận.", "🚫")
@@ -857,6 +917,14 @@ def handle_nav_query() -> None:
         go("home")
 
 
+def provider_is_linked(provider: str, row) -> bool:
+    """Kiểm tra liên kết OAuth, bỏ qua ID Facebook cũ trong cột legacy."""
+    value = row[PROVIDERS[provider]["col"]]
+    if provider == "github":
+        return str(value or "").startswith("github:")
+    return bool(value)
+
+
 def unlink_provider(provider: str) -> None:
     meta = PROVIDERS[provider]
     df = read_csv(F_USR, USR_COLS)
@@ -864,7 +932,7 @@ def unlink_provider(provider: str) -> None:
     if not m.any():
         return
     r = df[m].iloc[0]
-    others = [q for q in PROVIDERS if q != provider and r[PROVIDERS[q]["col"]]]
+    others = [q for q in PROVIDERS if q != provider and provider_is_linked(q, r)]
     if not has_password(r["password"]) and not others:
         flash("Hãy đặt mật khẩu hoặc liên kết phương thức khác trước khi hủy, nếu không bạn sẽ không thể đăng nhập.", "⚠️")
         return
@@ -2099,7 +2167,7 @@ TERMS_SECTIONS = [
     ]),
     ("2. Tài khoản và bảo mật", [
         "Cung cấp thông tin trung thực, chính xác; mỗi người chỉ nên sử dụng một tài khoản.",
-        "Tự bảo mật tên đăng nhập, mật khẩu và các phương thức đăng nhập Google/Facebook; không chia sẻ cho người khác. Mọi hoạt động phát sinh từ tài khoản được xem là do chính bạn thực hiện.",
+        "Tự bảo mật tên đăng nhập, mật khẩu và các phương thức đăng nhập Google/GitHub; không chia sẻ cho người khác. Mọi hoạt động phát sinh từ tài khoản được xem là do chính bạn thực hiện.",
         "Cửa hàng không bao giờ yêu cầu bạn cung cấp mật khẩu qua tin nhắn hoặc điện thoại.",
     ]),
     ("3. Ví tài khoản và nạp tiền", [
@@ -2685,12 +2753,12 @@ a.lp-social{display:flex;align-items:center;justify-content:center;gap:10px;padd
   text-decoration:none!important;white-space:nowrap;transition:transform .2s,box-shadow .2s,filter .2s;}
 a.lp-social:hover{transform:translateY(-2px);box-shadow:0 10px 24px rgba(0,0,0,.35);filter:brightness(1.04);}
 a.lp-social.google{background:#fff;color:#1f2937!important;border:1px solid #dadce0;}
-a.lp-social.facebook{background:#1877f2;color:#fff!important;border:1px solid #1877f2;}
+a.lp-social.github{background:#24292f;color:#fff!important;border:1px solid #24292f;}
 [class*='st-key-soc_'] button{min-height:46px!important;border-radius:14px!important;font-weight:700!important;white-space:nowrap;}
 .st-key-soc_login_google button,.st-key-soc_register_google button,.st-key-soc_link_google button{background:#ffffff!important;color:#1f2937!important;border:1px solid #dadce0!important;}
-.st-key-soc_login_facebook button,.st-key-soc_register_facebook button,.st-key-soc_link_facebook button{background:#1877f2!important;color:#ffffff!important;border:1px solid #1877f2!important;}
+.st-key-soc_login_github button,.st-key-soc_register_github button,.st-key-soc_link_github button{background:#24292f!important;color:#ffffff!important;border:1px solid #24292f!important;}
 .st-key-soc_login_google button p,.st-key-soc_register_google button p,.st-key-soc_link_google button p{color:#1f2937!important;}
-.st-key-soc_login_facebook button p,.st-key-soc_register_facebook button p,.st-key-soc_link_facebook button p{color:#ffffff!important;}
+.st-key-soc_login_github button p,.st-key-soc_register_github button p,.st-key-soc_link_github button p{color:#ffffff!important;}
 
 .lp-or{display:flex;align-items:center;gap:12px;margin:18px 0 14px;color:#9fb6e6;font-size:.78rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;}
 .lp-or::before,.lp-or::after{content:"";flex:1;height:1px;background:var(--line);}
@@ -2709,7 +2777,7 @@ a.lp-social.facebook{background:#1877f2;color:#fff!important;border:1px solid #1
 .lp-memo-pill{display:inline-block;padding:4px 12px;border-radius:10px;background:rgba(250,204,21,.16);border:1px solid rgba(250,204,21,.55);color:#fde047;font-family:var(--f-mono);font-weight:800;font-size:.96rem;}
 .lp-linkrow{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:16px;background:var(--panel);border:1px solid var(--line);}
 .lp-linkrow .ic{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;background:#fff;flex:none;}
-.lp-linkrow .ic.facebook{background:#1877f2;}
+.lp-linkrow .ic.github{background:#24292f;color:#fff;}
 .lp-linkrow small{display:block;color:#a6b8dc;}
 .lp-badge-on{margin-left:auto;padding:2px 10px;border-radius:99px;font-size:.7rem;font-weight:700;color:#86efac;background:rgba(34,197,94,.14);border:1px solid rgba(74,222,128,.45);white-space:nowrap;}
 .lp-badge-off{margin-left:auto;padding:2px 10px;border-radius:99px;font-size:.7rem;font-weight:700;color:#cbd5e1;background:rgba(148,163,184,.14);border:1px solid rgba(148,163,184,.38);white-space:nowrap;}
@@ -2762,7 +2830,7 @@ a.lp-social.facebook{background:#1877f2;color:#fff!important;border:1px solid #1
   background-image:linear-gradient(100deg,#f4cf6a 0%,#f4cf6a 35%,#fffbe6 50%,#f4cf6a 65%,#f4cf6a 100%);
   background-size:250% 100%;animation:lp-price-sweep 1.6s ease-in-out infinite;}
 
-/* Nút Google / Facebook: ánh sáng quét, nhấn xuống, vòng xoay khi đang chuyển hướng */
+/* Nút Google / GitHub: ánh sáng quét, nhấn xuống, vòng xoay khi đang chuyển hướng */
 a.lp-social{position:relative;overflow:hidden;}
 a.lp-social::before{content:"";position:absolute;top:0;bottom:0;left:0;width:40%;pointer-events:none;
   background:linear-gradient(105deg,transparent,rgba(255,255,255,.5),transparent);transform:translateX(-140%) skewX(-18deg);}
@@ -3584,9 +3652,9 @@ def account_panel() -> None:
             st.dataframe(pd.DataFrame(ord_rows), use_container_width=True, hide_index=True)
 
         st.markdown("#### 🔗 Liên kết tài khoản")
-        st.caption("Liên kết để đăng nhập nhanh bằng Google / Facebook mà không cần nhớ mật khẩu.")
+        st.caption("Liên kết để đăng nhập nhanh bằng Google / GitHub mà không cần nhớ mật khẩu.")
         for key, meta in PROVIDERS.items():
-            linked = bool(me[meta["col"]])
+            linked = provider_is_linked(key, me)
             r1, r2 = st.columns([2.4, 1.2], vertical_alignment="center")
             r1.markdown(
                 H(f"""
@@ -3610,7 +3678,7 @@ def account_panel() -> None:
                         st.button("Liên kết", key=f"socb_link_{key}", on_click=set_demo_provider, args=(key,), use_container_width=True)
 
         helped = ss.get("social_help")
-        if helped and not provider_ready(helped) and not me[PROVIDERS[helped]["col"]]:
+        if helped and not provider_ready(helped) and not provider_is_linked(helped, me):
             if demo_mode():
                 with st.form("demo_link"):
                     st.caption(f"🧪 Demo: mô phỏng liên kết {PROVIDERS[helped]['label']}")
@@ -3659,7 +3727,7 @@ def page_auth() -> None:
               <h2>Chào mừng đến<br>LAPTOP HCMUS</h2>
               <p>Một tài khoản cho mọi quyền lợi dành riêng cho sinh viên.</p>
               <div class="lp-auth-li"><i>💳</i><div><b>Ví tài khoản tiện lợi</b>Nạp tiền qua chuyển khoản ngân hàng và thanh toán nhanh chóng.</div></div>
-              <div class="lp-auth-li"><i>⚡</i><div><b>Đăng nhập một chạm</b>Dùng Google hoặc Facebook, không cần nhớ mật khẩu.</div></div>
+              <div class="lp-auth-li"><i>⚡</i><div><b>Đăng nhập một chạm</b>Dùng Google hoặc GitHub, không cần nhớ mật khẩu.</div></div>
               <div class="lp-auth-li"><i>🛒</i><div><b>Quản lý đơn hàng</b>Lưu thông tin nhận hàng và theo dõi lịch sử mua sắm.</div></div>
               <div class="lp-auth-li"><i>⭐</i><div><b>Đánh giá đã mua hàng</b>Chia sẻ trải nghiệm thật và nhận huy hiệu xác thực.</div></div>
             </div>
@@ -3688,7 +3756,7 @@ def page_auth() -> None:
                     if tomb is not None and exist.empty:
                         render_violation(violation_msg(tomb))
                     elif not exist.empty and not has_password(exist.iloc[0]["password"]):
-                        st.error("Tài khoản này được tạo bằng Google/Facebook. Hãy bấm nút đăng nhập mạng xã hội ở trên.")
+                        st.error("Tài khoản này được tạo bằng Google/GitHub. Hãy bấm nút đăng nhập mạng xã hội ở trên.")
                     else:
                         st.error("Sai tên đăng nhập hoặc mật khẩu.")
                 else:
@@ -3704,12 +3772,12 @@ def page_auth() -> None:
 
         else:
             social_buttons("register", "Đăng ký với")
-            st.caption("Đăng ký bằng Google/Facebook: bạn sẽ được yêu cầu đọc và đồng ý Thỏa thuận sử dụng ở lần đăng nhập đầu tiên.")
+            st.caption("Đăng ký bằng Google/GitHub: bạn sẽ được yêu cầu đọc và đồng ý Thỏa thuận sử dụng ở lần đăng nhập đầu tiên.")
             social_divider("hoặc tạo tài khoản bằng email")
             with st.form("register"):
                 fn = st.text_input("Họ và tên đầy đủ", placeholder="Nguyễn Văn A")
                 ru = st.text_input("Tên đăng nhập (3–20 ký tự viết liền)", placeholder="nguyenvana")
-                em = st.text_input("Email (không bắt buộc, dùng để liên kết Google/Facebook sau này)", placeholder="ban@gmail.com")
+                em = st.text_input("Email (không bắt buộc, dùng để liên kết Google/GitHub sau này)", placeholder="ban@gmail.com")
                 p1 = st.text_input("Mật khẩu (≥ 6 ký tự)", type="password", placeholder="Tối thiểu 6 ký tự")
                 p2 = st.text_input("Nhập lại mật khẩu", type="password", placeholder="Nhập lại mật khẩu")
                 with st.expander("📜 Đọc Thỏa thuận sử dụng của cửa hàng"):
@@ -4909,9 +4977,9 @@ def page_admin() -> None:
         adm_users["Số dư ví"] = [vnd(int(float(b or 0))) for b in users["balance"]]
         adm_users["đăng nhập qua"] = [
             ", ".join(
-                x for x, v in (("Mật khẩu", has_password(pw)), ("Google", bool(g)), ("Facebook", bool(f))) if v
+                x for x, v in (("Mật khẩu", has_password(pw)), ("Google", bool(g)), ("GitHub", str(github_value or "").startswith("github:"))) if v
             )
-            for pw, g, f in zip(users["password"], users["google_id"], users["facebook_id"])
+            for pw, g, github_value in zip(users["password"], users["google_id"], users["facebook_id"])
         ]
         st.dataframe(adm_users, use_container_width=True, hide_index=True)
 
@@ -5002,7 +5070,7 @@ st.markdown(
       <div class="lp-foot-grid">
         <div><b>{STORE_NAME}</b><span>Cửa hàng laptop dành cho sinh viên: MacBook M5 đủ màu và dàn Laptop Gaming RTX cấu hình cao.</span></div>
         <div><b>Chính sách</b><span>🚚 Miễn phí giao hàng nội thành</span><span>🛡️ Bảo hành chính hãng 12 tháng</span></div>
-        <div><b>Tài khoản</b><span>💳 Nạp tiền ví qua chuyển khoản ngân hàng</span><span>🔐 Đăng nhập Google / Facebook</span></div>
+        <div><b>Tài khoản</b><span>💳 Nạp tiền ví qua chuyển khoản ngân hàng</span><span>🔐 Đăng nhập Google / GitHub</span></div>
       </div>
       <div class="lp-foot-copy">© 2026 {STORE_NAME} · Đồ án Nhập môn Công nghệ Thông tin · ĐH Khoa học Tự nhiên - ĐHQG-HCM</div>
     </div>

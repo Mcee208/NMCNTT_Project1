@@ -106,6 +106,7 @@ CMP_COLS = ["sku", "store", "price", "url", "updated_at", "updated_by"]
 PRQ_COLS = ["id", "submitted_by", "created_at", "status", "sku", "name", "brand", "price", "cpu", "ram", "gpu", "ssd", "screen", "os", "description", "image", "reviewed_by", "reviewed_at", "note", "laptop_id", "kind", "target_id", "changes", "reason"]
 SES_COLS = ["token_hash", "username", "expires"]
 SESSION_DAYS = 7
+SESSION_QP = "s"  # tham số URL dự phòng khi cookie không dùng được
 
 @st.cache_resource(show_spinner=False)
 def get_supabase():
@@ -997,8 +998,14 @@ def sync_page_url() -> str:
             qp["d"] = str(detail)
     elif qp.get("d") is not None:
         del qp["d"]
+    tok = ss.get("auth_token") if ss.user else None
+    if tok:
+        if qp.get(SESSION_QP) != tok:
+            qp[SESSION_QP] = tok
+    elif qp.get(SESSION_QP) is not None:
+        del qp[SESSION_QP]
     ss._url_key = _url_key(page, detail)
-    qs = "?p=" + quote(str(page)) + (f"&d={int(detail)}" if detail is not None else "")
+    qs = "?p=" + quote(str(page)) + (f"&d={int(detail)}" if detail is not None else "") + (f"&{SESSION_QP}={quote(tok)}" if tok else "")
     return (
         "const L=P.__lp=P.__lp||{};"
         "const kOf=function(s){const u=new URLSearchParams(s);return (u.get('p')||'')+'|'+(u.get('d')||'');};"
@@ -1124,10 +1131,13 @@ def restore_session() -> None:
     ss._session_checked = True
     if ss.user:
         return
+    token = ""
     try:
         token = str(st.context.cookies.get(COOKIE_NAME, "") or "")
     except Exception:
-        return
+        pass
+    if not token:  # dự phòng: token đi theo URL (?s=...) vì F5 giữ nguyên URL
+        token = str(st.query_params.get(SESSION_QP, "") or "")
     if not token:
         return
     hit = _live_sessions()

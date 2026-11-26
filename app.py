@@ -2313,37 +2313,42 @@ def prq_select_all() -> None:
         ss[f"prq_sel_{rid}"] = val
 
 
-def approve_selected() -> None:
-    """Duyệt một lần tất cả yêu cầu đã tick; mỗi yêu cầu vẫn qua đủ các bước kiểm tra như duyệt lẻ."""
+def run_bulk(action: str) -> None:
+    """Duyệt / từ chối hàng loạt các mục đã tick, có thanh tiến trình. Mỗi mục vẫn qua đủ bước kiểm tra như thao tác lẻ."""
     if not _admin_only():
         return
     ids = [rid for rid in _pending_prq_ids() if ss.get(f"prq_sel_{rid}")]
     if not ids:
         flash("Bạn chưa tick yêu cầu nào.", "⚠️")
         return
-    ok = 0
-    errors = []
-    for rid in ids:
+    one, verb = (approve_product, "Đang duyệt") if action == "approve" else (reject_product, "Đang từ chối")
+    pb = st.progress(0.0, text=f"{verb} 0/{len(ids)}…")
+    ok, errors = 0, []
+    for i, rid in enumerate(ids, 1):
         before = len(ss.flash)
-        approve_product(rid)
+        if action == "approve":
+            one(rid)
+        else:
+            one(rid, "Không phù hợp")  # từ chối hàng loạt không cần lý do
         new = ss.flash[before:]
         del ss.flash[before:]
-        if new and new[-1][1] == "✅":
+        if new and new[-1][1] != "⚠️":
             ok += 1
         else:
-            errors.append(f"#{rid}: " + (new[-1][0] if new else "không duyệt được"))
+            errors.append(f"#{rid}: " + (new[-1][0] if new else "không thực hiện được"))
         ss[f"prq_sel_{rid}"] = False
+        pb.progress(i / len(ids), text=f"{verb} {i}/{len(ids)}…")
     ss["prq_sel_all"] = False
-    if ok:
-        flash(f"Đã duyệt {ok}/{len(ids)} yêu cầu.", "✅")
+    pb.empty()
+    flash(f"Đã {'duyệt' if action == 'approve' else 'từ chối'} {ok}/{len(ids)} yêu cầu.", "✅" if action == "approve" else "❌")
     for e in errors:
         flash(f"Bỏ qua {e}", "⚠️")
 
 
-def reject_product(rid: int) -> None:
+def reject_product(rid: int, note: str | None = None) -> None:
     if not _admin_only():
         return
-    note = str(ss.get(f"prq_note_{rid}") or "Không phù hợp").strip()
+    note = str(note or ss.get(f"prq_note_{rid}") or "Không phù hợp").strip()
     with topup_lock():
         prq = _read_csv_raw(F_PRQ, PRQ_COLS)
         m = prq["id"].astype(str) == str(rid)
@@ -3227,6 +3232,13 @@ CSS_FIX = """
 [class*='st-key-card_']::before{content:"";position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .3s ease;z-index:1;
   background:radial-gradient(260px circle at var(--mx,50%) var(--my,50%),rgba(125,211,252,.20),transparent 60%);}
 [class*='st-key-card_']:hover::before{opacity:1;}
+
+/* Hiệu ứng đang tải: thanh sáng chạy trên cùng + làm mờ nhẹ phần đang cập nhật */
+.stApp:has([data-testid='stStatusWidget'])::after{content:"";position:fixed;top:0;left:0;right:0;height:3px;z-index:2147483000;pointer-events:none;
+  background:linear-gradient(90deg,transparent,#4cc9f0,#a78bfa,#f472b6,transparent);background-size:40% 100%;background-repeat:no-repeat;animation:lp-load 1s linear infinite;}
+@keyframes lp-load{from{background-position:-40% 0}to{background-position:140% 0}}
+[data-stale='true']{opacity:.6;transition:opacity .25s ease;}
+[data-testid='stStatusWidget']{border-radius:999px!important;backdrop-filter:blur(8px);}
 
 /* Chuyển tab / mục mượt */
 [class*='st-key-admin_tab_pane_'],[class*='st-key-staff_tab_pane_']{animation:lp-tab-in .45s cubic-bezier(.22,1,.36,1) both;}
@@ -4212,6 +4224,13 @@ def staff_queue() -> None:
                 st.rerun()
 
 
+def lazy_pane(pane, key: str, i: int):
+    """Chỉ chạy nội dung của tab đang mở (dùng: `for _ in lazy_pane(tab, "admin_tab", 0):`). Các tab còn lại không tốn thời gian dựng."""
+    if ss.get(key) == i:
+        with pane:
+            yield
+
+
 def persistent_tabs(labels: list[str], key: str) -> list:
     """Thay st.tabs: tab đang chọn được lưu trong session_state nên sau mỗi lần rerun
     (duyệt sản phẩm, duyệt nạp tiền, lưu cài đặt...) người dùng vẫn ở đúng tab đang làm."""
@@ -4742,7 +4761,10 @@ def _edit_diff_html(r, lap: pd.DataFrame) -> str:
     return '<div class="lp-cmp-wrap"><table class="lp-cmp lp-diff"><thead><tr><th>Trường</th><th>Hiện tại trong kho</th><th>Sau khi chỉnh sửa (đề xuất)</th></tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>"
 
 
-def admin_products_tab() -> None:
+@st.fragment
+def _prq_review_list() -> None:
+    """Danh sách duyệt là fragment: tick chọn / đổi giá chỉ vẽ lại phần này, không chạy lại cả trang Admin
+    (nhanh hơn, không nhảy lên đầu trang). Chỉ khi duyệt / từ chối mới st.rerun() toàn trang để cập nhật số chờ duyệt."""
     prq = read_csv(F_PRQ, PRQ_COLS)
     lap = load_laptops()
     pend = prq[prq["status"] == ST_PRQ_PENDING]
@@ -4752,10 +4774,17 @@ def admin_products_tab() -> None:
     else:
         n_sel = sum(1 for x in pend["id"] if ss.get(f"prq_sel_{int(float(x))}"))
         with st.container(key="prq_bulk_bar"):
-            bc1, bc2 = st.columns([1, 1.4], vertical_alignment="center")
+            bc1, bc2, bc3 = st.columns([1, 1.3, 1.3], vertical_alignment="center")
             bc1.checkbox(f"Chọn tất cả ({len(pend)})", key="prq_sel_all", on_change=prq_select_all)
-            bc2.button(f"✅ Duyệt {n_sel} mục đã chọn" if n_sel else "✅ Duyệt các mục đã chọn", key="prq_ok_selected", type="primary",
-                       disabled=n_sel == 0, on_click=approve_selected, use_container_width=True)
+            if bc2.button(f"✅ Duyệt {n_sel} mục đã chọn" if n_sel else "✅ Duyệt các mục đã chọn", key="prq_ok_selected", type="primary",
+                          disabled=n_sel == 0, use_container_width=True):
+                run_bulk("approve")
+                st.rerun()
+            with bc3.popover(f"❌ Từ chối {n_sel} mục đã chọn" if n_sel else "❌ Từ chối các mục đã chọn", use_container_width=True, disabled=n_sel == 0):
+                st.caption(f"Từ chối {n_sel} yêu cầu đã tick (không cần lý do). Thao tác này không hoàn tác được.")
+                if st.button("Xác nhận từ chối", key="prq_no_selected", type="primary", use_container_width=True):
+                    run_bulk("reject")
+                    st.rerun()
     for _, r in pend.iterrows():
         rid = int(float(r["id"]))
         is_edit = r["kind"] == "edit"
@@ -4787,11 +4816,21 @@ def admin_products_tab() -> None:
                         st.caption(r["description"])
                     st.number_input("Giá bán khi đưa vào kho (₫)", min_value=1000000, step=100000, value=int(float(r["price"])), key=f"prq_price_{rid}")
                 b1, b2 = st.columns(2)
-                b1.button("✅ Duyệt & cập nhật vào kho" if is_edit else "✅ Duyệt & đưa vào kho", key=f"prq_ok_{rid}", type="primary", on_click=approve_product, args=(rid,), use_container_width=True)
+                if b1.button("✅ Duyệt & cập nhật vào kho" if is_edit else "✅ Duyệt & đưa vào kho", key=f"prq_ok_{rid}", type="primary", use_container_width=True):
+                    with st.spinner("Đang cập nhật vào kho…"):
+                        approve_product(rid)
+                    st.rerun()
                 with b2.popover("❌ Từ chối", use_container_width=True):
                     st.text_input("Lý do từ chối", key=f"prq_note_{rid}")
-                    st.button("Xác nhận từ chối", key=f"prq_no_{rid}", on_click=reject_product, args=(rid,), use_container_width=True)
+                    if st.button("Xác nhận từ chối", key=f"prq_no_{rid}", use_container_width=True):
+                        reject_product(rid)
+                        st.rerun()
         st.write("")
+
+
+def admin_products_tab() -> None:
+    prq = read_csv(F_PRQ, PRQ_COLS)
+    _prq_review_list()
     done = prq[prq["status"] != ST_PRQ_PENDING].iloc[::-1]
     if not done.empty:
         st.subheader("🗂️ Lịch sử yêu cầu")
@@ -5142,7 +5181,7 @@ def page_admin() -> None:
         "🔐 Tài khoản & Giao diện",
     ], "admin_tab")
 
-    with tab_prod:
+    for _ in lazy_pane(tab_prod, "admin_tab", 0):
         st.subheader("➕ Thêm sản phẩm mới (Tự động sinh mã SKU & cộng giá theo màu)")
         with st.form("add_laptop", clear_on_submit=True):
             a1, a2, a3 = st.columns([2, 1, 1])
@@ -5293,7 +5332,7 @@ def page_admin() -> None:
                             flash(f"Đã cập nhật sản phẩm {r['sku']}", "✅")
                             st.rerun()
 
-    with tab_vch:
+    for _ in lazy_pane(tab_vch, "admin_tab", 1):
         st.subheader("🎟️ Danh sách Voucher")
         df_v_show = read_csv(F_VCH, VCH_COLS)
         if df_v_show.empty:
@@ -5319,7 +5358,7 @@ def page_admin() -> None:
                     flash(f"Đã lưu voucher {c_up}", "🎟️")
                     st.rerun()
 
-    with tab_usr:
+    for _ in lazy_pane(tab_usr, "admin_tab", 2):
         st.subheader("👥 CSDL Tài khoản người dùng (`users.csv`)")
         adm_users = users[["username", "fullname", "role", "email"]].copy()
         adm_users["Số dư ví"] = [vnd(int(float(b or 0))) for b in users["balance"]]
@@ -5362,14 +5401,14 @@ def page_admin() -> None:
                     flash(f"Đã tạo tài khoản {nu.strip()} ({nrole})", "✅")
                     st.rerun()
 
-    with tab_ord:
+    for _ in lazy_pane(tab_ord, "admin_tab", 3):
         st.subheader("📦 Lịch sử giao dịch đã xác nhận (`orders.csv`)")
         if orders.empty:
             st.info("Chưa có đơn hàng nào.")
         else:
             st.dataframe(orders, use_container_width=True, hide_index=True)
 
-    with tab_top:
+    for _ in lazy_pane(tab_top, "admin_tab", 4):
         st.subheader("💰 Lịch sử nạp tiền vào ví (`topups.csv`)")
         if topups.empty:
             st.info("Chưa có giao dịch nạp tiền nào.")
@@ -5379,19 +5418,19 @@ def page_admin() -> None:
                 st.warning(f"⏳ Có {_np} giao dịch đang chờ duyệt trong Staff Portal.")
             st.dataframe(topups.iloc[::-1].drop(columns=["sha256", "phash"]), use_container_width=True, hide_index=True)
 
-    with tab_staff:
+    for _ in lazy_pane(tab_staff, "admin_tab", 5):
         admin_staff_tab()
 
-    with tab_set:
+    for _ in lazy_pane(tab_set, "admin_tab", 6):
         admin_settings_tab()
 
-    with tab_prq:
+    for _ in lazy_pane(tab_prq, "admin_tab", 7):
         admin_products_tab()
 
-    with tab_cmp:
+    for _ in lazy_pane(tab_cmp, "admin_tab", 8):
         admin_compare_tab()
 
-    with tab_prof:
+    for _ in lazy_pane(tab_prof, "admin_tab", 9):
         admin_profile_tab()
 
 

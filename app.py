@@ -2302,6 +2302,44 @@ def approve_product(rid: int) -> None:
     flash(*done_msg)
 
 
+def _pending_prq_ids() -> list[int]:
+    prq = read_csv(F_PRQ, PRQ_COLS)
+    return [int(float(x)) for x in prq[prq["status"] == ST_PRQ_PENDING]["id"]]
+
+
+def prq_select_all() -> None:
+    val = bool(ss.get("prq_sel_all"))
+    for rid in _pending_prq_ids():
+        ss[f"prq_sel_{rid}"] = val
+
+
+def approve_selected() -> None:
+    """Duyệt một lần tất cả yêu cầu đã tick; mỗi yêu cầu vẫn qua đủ các bước kiểm tra như duyệt lẻ."""
+    if not _admin_only():
+        return
+    ids = [rid for rid in _pending_prq_ids() if ss.get(f"prq_sel_{rid}")]
+    if not ids:
+        flash("Bạn chưa tick yêu cầu nào.", "⚠️")
+        return
+    ok = 0
+    errors = []
+    for rid in ids:
+        before = len(ss.flash)
+        approve_product(rid)
+        new = ss.flash[before:]
+        del ss.flash[before:]
+        if new and new[-1][1] == "✅":
+            ok += 1
+        else:
+            errors.append(f"#{rid}: " + (new[-1][0] if new else "không duyệt được"))
+        ss[f"prq_sel_{rid}"] = False
+    ss["prq_sel_all"] = False
+    if ok:
+        flash(f"Đã duyệt {ok}/{len(ids)} yêu cầu.", "✅")
+    for e in errors:
+        flash(f"Bỏ qua {e}", "⚠️")
+
+
 def reject_product(rid: int) -> None:
     if not _admin_only():
         return
@@ -4711,6 +4749,13 @@ def admin_products_tab() -> None:
     st.subheader(f"📥 Yêu cầu từ staff ({len(pend)} chờ duyệt)")
     if pend.empty:
         st.caption("Không có yêu cầu nào đang chờ.")
+    else:
+        n_sel = sum(1 for x in pend["id"] if ss.get(f"prq_sel_{int(float(x))}"))
+        with st.container(key="prq_bulk_bar"):
+            bc1, bc2 = st.columns([1, 1.4], vertical_alignment="center")
+            bc1.checkbox(f"Chọn tất cả ({len(pend)})", key="prq_sel_all", on_change=prq_select_all)
+            bc2.button(f"✅ Duyệt {n_sel} mục đã chọn" if n_sel else "✅ Duyệt các mục đã chọn", key="prq_ok_selected", type="primary",
+                       disabled=n_sel == 0, on_click=approve_selected, use_container_width=True)
     for _, r in pend.iterrows():
         rid = int(float(r["id"]))
         is_edit = r["kind"] == "edit"
@@ -4729,6 +4774,7 @@ def admin_products_tab() -> None:
                 else:
                     st.caption("Không có ảnh")
             with c2:
+                st.checkbox("Chọn để duyệt", key=f"prq_sel_{rid}")
                 st.markdown(f"**{_kind_label(r)}** · **{esc(r['name'])}** · `{esc(r['sku'])}`  \nGửi bởi **@{esc(r['submitted_by'])}** lúc {esc(r['created_at'])}", unsafe_allow_html=True)
                 if is_edit:
                     if r["reason"]:

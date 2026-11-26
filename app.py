@@ -246,12 +246,24 @@ def _df_records(df: pd.DataFrame, cols: list[str]) -> list[dict]:
             for row in df.reindex(columns=cols).to_dict("records")]
 
 
+def _cell_str(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        if v != v:
+            return ""
+        if v.is_integer():
+            return str(int(v))
+    return str(v)
+
+
 def _read_csv_raw(path: Path, cols: list[str]) -> pd.DataFrame:
     table, table_cols, _ = _table_for(path)
     rows = _db_all(table)
     if not rows:
         return pd.DataFrame(columns=cols)
-    return pd.DataFrame(rows).reindex(columns=table_cols)[cols].fillna("")
+    # Mọi ô đều là chuỗi như thời dùng CSV: pandas 3 không cho gán chuỗi vào cột int64 (lỗi ở approve_product).
+    return pd.DataFrame(rows).reindex(columns=table_cols)[cols].map(_cell_str)
 
 
 def read_csv(path: Path, cols: list[str]) -> pd.DataFrame:

@@ -177,10 +177,17 @@ def is_gaming_laptop(row) -> bool:
     return any(k in text for k in keywords)
 
 
+@st.cache_resource(show_spinner=False)
+def _check_db_once() -> bool:
+    """Chỉ kiểm tra kết nối một lần cho mỗi tiến trình (trước đây chạy lại ở MỖI lần tương tác)."""
+    get_supabase().table("app_settings").select("key").limit(1).execute()
+    return True
+
+
 def init_data() -> None:
     """Kiểm tra kết nối; schema và dữ liệu được quản lý trực tiếp trên Supabase."""
     try:
-        get_supabase().table("app_settings").select("key").limit(1).execute()
+        _check_db_once()
     except Exception as exc:
         raise RuntimeError("Không kết nối được Supabase hoặc thiếu bảng app_settings. Kiểm tra secrets và schema.sql.") from exc
 
@@ -192,7 +199,11 @@ def _table_for(path: Path):
     raise ValueError(f"Không có ánh xạ Supabase cho dữ liệu: {path.name}")
 
 
-def _db_all(table: str) -> list[dict]:
+_lock_depth = threading.local()  # độ sâu khóa topup (dùng chung với topup_lock)
+DB_CACHE_TTL = 30  # giây; mọi lần ghi qua write_csv/save_settings sẽ xóa cache ngay nên dữ liệu không bị cũ
+
+
+def _db_all_raw(table: str) -> list[dict]:
     client, rows, offset, size = get_supabase(), [], 0, 1000
     while True:
         batch = client.table(table).select("*").range(offset, offset + size - 1).execute().data or []
@@ -200,6 +211,25 @@ def _db_all(table: str) -> list[dict]:
         if len(batch) < size:
             return rows
         offset += size
+
+
+@st.cache_data(ttl=DB_CACHE_TTL, show_spinner=False)
+def _db_all_cached(table: str) -> list[dict]:
+    return _db_all_raw(table)
+
+
+def _db_all(table: str, fresh: bool = False) -> list[dict]:
+    """Đọc cả bảng. Mặc định dùng cache (nhanh); fresh=True bỏ qua cache (dùng trước khi ghi)."""
+    if fresh or getattr(_lock_depth, "n", 0) > 0:  # đang giữ khóa đọc-sửa-ghi => luôn đọc mới
+        return _db_all_raw(table)
+    return _db_all_cached(table)
+
+
+def _invalidate_db_cache() -> None:
+    try:
+        _db_all_cached.clear()
+    except Exception:
+        pass
 
 
 def _clean_db_value(value):
@@ -235,10 +265,17 @@ def write_csv(df: pd.DataFrame, path: Path) -> None:
     """Adapter tương thích code cũ: mọi thay đổi được ghi vào Supabase."""
     table, cols, pk = _table_for(path)
     client, new_rows = get_supabase(), _df_records(df, cols)
+    try:
+        _write_rows(client, table, cols, pk, new_rows)
+    finally:
+        _invalidate_db_cache()
+
+
+def _write_rows(client, table: str, cols: list[str], pk, new_rows: list[dict]) -> None:
     if pk is None:
         # Schema hiện tại không có unique key cho các bảng nhật ký/lịch sử.
         # Chỉ append phần phát sinh; không truncate hay ghi đè dữ liệu cũ.
-        old_rows = _db_all(table)
+        old_rows = _db_all(table, fresh=True)
         counts = {}
         for row in old_rows:
             sig = _row_signature(row, cols)
@@ -253,9 +290,13 @@ def write_csv(df: pd.DataFrame, path: Path) -> None:
         if additions:
             client.table(table).insert(additions).execute()
         return
-    if new_rows:
-        client.table(table).upsert(new_rows, on_conflict=",".join(pk)).execute()
-    old_rows = _db_all(table)
+    old_rows = _db_all(table, fresh=True)
+    old_sig = {tuple(str(r.get(k) or "") for k in pk): _row_signature(r, cols) for r in old_rows}
+    # Chỉ upsert những dòng mới hoặc có thay đổi (trước đây ghi lại TOÀN BỘ bảng ở mỗi lần lưu).
+    changed = [r for r in new_rows
+               if old_sig.get(tuple(str(r.get(k) or "") for k in pk)) != _row_signature(r, cols)]
+    if changed:
+        client.table(table).upsert(changed, on_conflict=",".join(pk)).execute()
     new_keys = {tuple(str(r.get(k) or "") for k in pk) for r in new_rows}
     for old in old_rows:
         old_key = tuple(str(old.get(k) or "") for k in pk)
@@ -357,10 +398,20 @@ def sku_color_badge(sku: str) -> str:
     return ""
 
 
-def file_uri(path: Path) -> str:
+@st.cache_data(show_spinner=False, max_entries=256)
+def _file_uri_cached(path_str: str, mtime: float) -> str:
+    path = Path(path_str)
     mimes = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".svg": "image/svg+xml"}
     mime = mimes.get(path.suffix.lower(), "image/png")
     return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode()
+
+
+def file_uri(path: Path) -> str:
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return _file_uri_cached(str(path), mtime)
 
 
 def laptop_svg(brand: str, sku: str) -> str:
@@ -879,16 +930,28 @@ def handle_oauth_callback() -> None:
 VALID_PAGES = ("home", "detail", "cart", "auth", "admin", "staff", "advisor", "support", "staff_profile")
 
 
+def _role_allows(p: str) -> bool:
+    role = ss.user["role"] if ss.user else ""
+    if p == "admin":
+        return role == "admin"
+    if p == "staff":
+        return role in ("staff", "admin")
+    if p == "staff_profile":
+        return role == "staff"
+    return True
+
+
+def _url_key(p, d) -> str:
+    return f"{p or ''}|{d if d is not None else ''}"
+
+
 def restore_page() -> None:
     """Phiên mới (vừa tải lại trang): quay lại đúng trang đang xem, đọc từ tham số ?p= trên URL."""
     if ss.get("_page_restored"):
         return
     ss._page_restored = True
     p = st.query_params.get("p")
-    if p not in VALID_PAGES:
-        return
-    role = ss.user["role"] if ss.user else ""
-    if (p == "admin" and role != "admin") or (p == "staff" and role not in ("staff", "admin")) or (p == "staff_profile" and role != "staff"):
+    if p not in VALID_PAGES or not _role_allows(p):
         return
     if p == "detail":
         try:
@@ -898,16 +961,59 @@ def restore_page() -> None:
     ss.page = p
 
 
-def sync_page_url() -> None:
-    """Gọi cuối mỗi lượt chạy: ghi trang hiện tại lên URL để F5 không bị nhảy về trang chủ."""
+def apply_browser_nav() -> None:
+    """Nút Back/Forward của trình duyệt: nếu URL (?p=, ?d=) khác với URL do app ghi lần trước
+    thì người dùng vừa bấm Back/Forward => chuyển app sang đúng trang đó (giữ nguyên giỏ hàng và đăng nhập)."""
     qp = st.query_params
-    if qp.get("p") != ss.page:
-        qp["p"] = ss.page
-    if ss.page == "detail" and ss.get("detail_id") is not None:
-        if qp.get("d") != str(ss.detail_id):
-            qp["d"] = str(ss.detail_id)
+    key = _url_key(qp.get("p"), qp.get("d"))
+    last = ss.get("_url_key")
+    ss._url_key = key
+    if last is None or key == last:
+        return
+    p = qp.get("p")
+    if p not in VALID_PAGES or not _role_allows(p):
+        return
+    if p == "detail":
+        try:
+            ss.detail_id = int(qp.get("d"))
+        except (TypeError, ValueError):
+            return
+    if p != ss.page:
+        ss.page = p
+        if p != "cart":
+            ss.order_done = None
+
+
+def sync_page_url() -> str:
+    """Gọi cuối mỗi lượt chạy: ghi trang hiện tại lên URL (F5 không bị nhảy về trang chủ)
+    và trả về đoạn JS tạo mục lịch sử trình duyệt cho mỗi lần đổi trang (để nút Back hoạt động)."""
+    qp = st.query_params
+    page = ss.page
+    detail = ss.get("detail_id") if page == "detail" else None
+    if qp.get("p") != page:
+        qp["p"] = page
+    if detail is not None:
+        if qp.get("d") != str(detail):
+            qp["d"] = str(detail)
     elif qp.get("d") is not None:
         del qp["d"]
+    ss._url_key = _url_key(page, detail)
+    qs = "?p=" + quote(str(page)) + (f"&d={int(detail)}" if detail is not None else "")
+    return (
+        "const L=P.__lp=P.__lp||{};"
+        "const kOf=function(s){const u=new URLSearchParams(s);return (u.get('p')||'')+'|'+(u.get('d')||'');};"
+        f"const key={json.dumps(ss._url_key)},qs={json.dumps(qs)};"
+        "if(L.key===undefined){L.key=key;L.qs=qs;}"
+        "else if(L.key!==key){"
+        "const base=P.location.pathname;"
+        "try{P.history.replaceState({lp:1},'',base+L.qs);P.history.pushState({lp:1},'',base+qs);}catch(e){}"
+        "L.key=key;L.qs=qs;}"
+        "if(!L.bound){L.bound=true;"
+        "P.addEventListener('popstate',function(){"
+        "L.key=kOf(P.location.search);L.qs=P.location.search;"
+        "setTimeout(function(){const b=P.document.querySelector('.st-key-lp_nav_bridge button');if(b){b.click();}},80);"
+        "});}"
+    )
 
 
 def handle_nav_query() -> None:
@@ -1038,33 +1144,39 @@ def restore_session() -> None:
 
 
 def _run_js(js: str) -> None:
-    code = f"<script>try{{const d=window.parent.document;{js}}}catch(e){{}}</script>"
+    """Chạy JS ở trang chính. Ưu tiên st.html (không cần iframe), dự phòng components.html.
+    P = cửa sổ của app Streamlit; mỗi lượt chạy chèn một nonce để trình duyệt luôn chạy lại đoạn mã."""
+    body = f"/*{time.time():.3f}*/{js}"
+    try:
+        st.html(f"<script>(function(){{const P=window;const d=document;try{{{body}}}catch(e){{}}}})();</script>", unsafe_allow_javascript=True)
+        return
+    except Exception:
+        pass
     try:
         import streamlit.components.v1 as components
 
-        components.html(code, height=0)
+        components.html(f"<script>(function(){{const P=window.parent;const d=P.document;try{{{body}}}catch(e){{}}}})();</script>", height=0)
     except Exception:
-        try:
-            st.html(code, unsafe_allow_javascript=True)
-        except Exception:
-            pass
+        pass
 
 
-def sync_auth_cookie() -> None:
-    """Gọi cuối mỗi lần chạy: cấp cookie khi vừa đăng nhập, xóa cookie khi đăng xuất."""
-    js = ""
+def sync_auth_cookie() -> str:
+    """Trả về JS đặt/xóa cookie đăng nhập. Cookie được đặt lại ở MỌI lượt chạy khi đang đăng nhập
+    (trước đây chỉ đặt một lần nên nếu iframe bị hủy do rerun nhanh thì cookie không bao giờ được lưu)."""
     if ss.get("_clear_cookie"):
         ss._clear_cookie = False
-        js = f"d.cookie='{COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax';"
-    elif ss.user and ss.get("auth_user") != ss.user["username"]:
+        return f"d.cookie='{COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax';"
+    if not ss.user:
+        return ""
+    if ss.get("auth_user") != ss.user["username"] or not ss.get("auth_token"):
         if ss.get("auth_token"):
             drop_session(ss.auth_token)
         token = create_session(ss.user["username"])
         ss.auth_token, ss.auth_user = token, ss.user["username"]
-        secure = "; Secure" if app_url().startswith("https") else ""
-        js = f"d.cookie='{COOKIE_NAME}={token}; path=/; max-age={SESSION_DAYS * 86400}; SameSite=Lax{secure}';"
-    if js:
-        _run_js(js)
+    return (
+        f"d.cookie='{COOKIE_NAME}={ss.auth_token}; path=/; max-age={SESSION_DAYS * 86400}; SameSite=Lax'"
+        "+(P.location.protocol==='https:'?'; Secure':'');"
+    )
 
 
 # =====================================================
@@ -1098,9 +1210,6 @@ EDIT_RX = {n: re.compile(r"(?<![a-z0-9])(?:" + f + r")(?![a-z0-9])") for n, f in
 @st.cache_resource
 def _mem_lock():
     return threading.RLock()
-
-
-_lock_depth = threading.local()
 
 
 @contextlib.contextmanager
@@ -1158,6 +1267,7 @@ def save_settings(d: dict) -> None:
     rows = [{"key": str(k), "value": v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)} for k, v in d.items()]
     if rows:
         get_supabase().table("app_settings").upsert(rows, on_conflict="key").execute()
+        _invalidate_db_cache()
 
 
 def setting(key: str, default: str = "") -> str:
@@ -2959,7 +3069,62 @@ a.lp-tel:hover{transform:translateY(-2px);box-shadow:0 8px 22px rgba(34,197,94,.
   [class*='st-key-card_']{animation:none!important;}
 }
 """
-st.markdown(f"<style>{CSS}{_confetti_css()}</style>", unsafe_allow_html=True)
+CSS_FIX = """
+/* ===== SỬA LỖI GIAO DIỆN (v2) ===== */
+
+/* 1) Logo + tên cửa hàng: không bị cắt / đè bởi ô tìm kiếm */
+.lp-brandlink{display:inline-flex;align-items:center;gap:12px;white-space:nowrap;cursor:pointer;transition:transform .25s ease,filter .25s ease;}
+.st-key-brandwrap:hover .lp-brandlink{transform:translateY(-2px) scale(1.01);filter:brightness(1.1);}
+.lp-brandtext{min-width:0;}
+.lp-store{font-size:clamp(1.02rem,.55rem + .8vw,1.35rem)!important;line-height:1.25;padding-right:.18em;white-space:nowrap;overflow:visible;animation:none!important;}
+.lp-logo{animation:none!important;}
+.st-key-topbar [data-testid='stColumn']:first-child,.st-key-topbar [data-testid='column']:first-child{min-width:max-content!important;flex-shrink:0!important;position:relative;z-index:3;}
+.st-key-topbar [data-testid='stColumn']:nth-child(2),.st-key-topbar [data-testid='column']:nth-child(2){position:relative;z-index:1;}
+.st-key-brandwrap{position:relative;}
+.st-key-brandwrap [data-testid='stVerticalBlock']{gap:0!important;}
+.st-key-brand_home{position:absolute!important;inset:0;z-index:5;margin:0!important;width:100%!important;}
+.st-key-brand_home [data-testid='stButton'],.st-key-brand_home .stButton{height:100%;width:100%;}
+.st-key-brand_home button{width:100%!important;height:100%!important;min-height:0!important;opacity:0!important;cursor:pointer;padding:0!important;}
+
+/* 2) Thanh đầu trang nhẹ hơn: bớt blur + tắt hiệu ứng lặp vô hạn (giảm giật khi cuộn / tương tác) */
+.st-key-topbar{backdrop-filter:blur(12px) saturate(140%)!important;-webkit-backdrop-filter:blur(12px) saturate(140%)!important;}
+.st-key-topbar::before{animation:none!important;filter:none!important;}
+
+/* 3) Thông báo st.info / st.success / st.warning / st.error: luôn đọc được, không phụ thuộc theme sáng/tối */
+[data-testid='stAlert']{background:transparent!important;}
+[data-testid='stAlert'] [data-baseweb='notification'],[data-testid='stAlert']>div{
+  background:rgba(17,29,63,.96)!important;border:1px solid rgba(125,211,252,.5)!important;border-radius:14px!important;box-shadow:none!important;}
+[data-testid='stAlert'] p,[data-testid='stAlert'] li,[data-testid='stAlert'] span,[data-testid='stAlert'] strong,[data-testid='stAlert'] em,
+[data-testid='stAlert'] a,[data-testid='stAlert'] label,[data-testid='stAlert'] [data-testid='stMarkdownContainer']{
+  color:#e8f1ff!important;-webkit-text-fill-color:#e8f1ff!important;background:transparent!important;}
+[data-testid='stAlert'] code{background:rgba(255,255,255,.16)!important;color:#ffffff!important;-webkit-text-fill-color:#ffffff!important;border:1px solid rgba(255,255,255,.30)!important;}
+[data-testid='stAlert'] mark{background:transparent!important;color:inherit!important;}
+[data-testid='stAlert'] svg{color:currentColor;}
+[data-testid='stAlert']:has([data-testid='stAlertContentSuccess']) [data-baseweb='notification'],
+[data-testid='stAlert']:has([data-testid='stAlertContentSuccess'])>div{background:rgba(21,94,52,.55)!important;border-color:rgba(74,222,128,.65)!important;}
+[data-testid='stAlert']:has([data-testid='stAlertContentWarning']) [data-baseweb='notification'],
+[data-testid='stAlert']:has([data-testid='stAlertContentWarning'])>div{background:rgba(113,63,18,.62)!important;border-color:rgba(250,204,21,.65)!important;}
+[data-testid='stAlert']:has([data-testid='stAlertContentError']) [data-baseweb='notification'],
+[data-testid='stAlert']:has([data-testid='stAlertContentError'])>div{background:rgba(127,29,29,.58)!important;border-color:rgba(248,113,113,.70)!important;}
+[data-testid='stAlert']:has([data-testid='stAlertContentInfo']) [data-baseweb='notification'],
+[data-testid='stAlert']:has([data-testid='stAlertContentInfo'])>div{background:rgba(12,74,110,.55)!important;border-color:rgba(56,189,248,.65)!important;}
+[data-testid='stAlert']:has([data-testid='stAlertContentSuccess']) :is(p,li,span,strong,a){color:#dcfce7!important;-webkit-text-fill-color:#dcfce7!important;}
+[data-testid='stAlert']:has([data-testid='stAlertContentWarning']) :is(p,li,span,strong,a){color:#fef3c7!important;-webkit-text-fill-color:#fef3c7!important;}
+[data-testid='stAlert']:has([data-testid='stAlertContentError']) :is(p,li,span,strong,a){color:#fee2e2!important;-webkit-text-fill-color:#fee2e2!important;}
+[data-testid='stAlert']:has([data-testid='stAlertContentInfo']) :is(p,li,span,strong,a){color:#e0f2fe!important;-webkit-text-fill-color:#e0f2fe!important;}
+[data-testid='stToast'],[data-testid='stToastContainer'] [role='alert']{background:#111d3f!important;border:1px solid rgba(125,211,252,.45)!important;border-radius:14px!important;}
+[data-testid='stToast'] *{color:#f1f5ff!important;-webkit-text-fill-color:#f1f5ff!important;}
+[data-testid='stException'],[data-testid='stException'] *{color:#fee2e2!important;}
+
+/* 4) Khối kỹ thuật ẩn (cầu nối nút Back + JS cookie) – không chiếm chỗ trên trang */
+[data-testid='stElementContainer']:has(>.st-key-lpbridge),[data-testid='stElementContainer']:has(>.st-key-lpjs),
+[data-testid='stLayoutWrapper']:has(>.st-key-lpbridge),[data-testid='stLayoutWrapper']:has(>.st-key-lpjs),
+.st-key-lpbridge,.st-key-lpjs{position:absolute!important;width:1px!important;height:1px!important;overflow:hidden!important;opacity:0!important;pointer-events:none!important;margin:0!important;padding:0!important;}
+
+/* 5) Tôn trọng người dùng tắt hiệu ứng chuyển động */
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important;}}
+"""
+st.markdown(f"<style>{CSS}{CSS_FIX}{_confetti_css()}</style>", unsafe_allow_html=True)
 
 # =====================================================
 # 6. KHỞI TẠO & NẠP DỮ LIỆU
@@ -2973,6 +3138,7 @@ except Exception as exc:
 sync_local_images_to_storage()
 restore_session()
 restore_page()
+apply_browser_nav()
 handle_oauth_callback()
 handle_nav_query()
 enforce_account_status()
@@ -3021,29 +3187,32 @@ n_active = (
 
 with st.container(key="topbar"):
     if show_filters:
-        ratios = [1.7, 3.2, 1.0, 1.25, 1.05, 1.2, 1.3] + ([1.2] if portal_page else [])
+        ratios = [2.35, 3.0, 1.0, 1.25, 1.05, 1.2, 1.3] + ([1.2] if portal_page else [])
         tb = iter(st.columns(ratios, vertical_alignment="center"))
         c_brand, c_search, c_flt, c_ai, c_help, c_cart, c_auth = (next(tb) for _ in range(7))
         c_admin = next(tb, None)
     else:
-        ratios = [2.0, 2.2, 1.25, 1.1, 1.3, 1.4, 1.3]
+        ratios = [2.35, 2.0, 1.25, 1.1, 1.3, 1.4, 1.3]
         tb = iter(st.columns(ratios, vertical_alignment="center"))
         c_brand, _c_spacer, c_ai, c_help, c_cart, c_auth, c_admin = (next(tb) for _ in range(7))
         c_search = c_flt = None
 
     with c_brand:
-        st.markdown(
-            H(f"""
-            <a class="lp-brandlink" href="?nav=home" target="_self" title="Về trang chủ LAPTOP HCMUS">
-              <div class="lp-logo">{logo_html}</div>
-              <div>
-                <div class="lp-store">{STORE_NAME}</div>
-                <div class="lp-tagline">Tech store · Since 2026</div>
-              </div>
-            </a>
-            """),
-            unsafe_allow_html=True,
-        )
+        with st.container(key="brandwrap"):
+            st.markdown(
+                H(f"""
+                <div class="lp-brandlink" title="Về trang chủ {esc(STORE_NAME)}">
+                  <div class="lp-logo">{logo_html}</div>
+                  <div class="lp-brandtext">
+                    <div class="lp-store">{esc(STORE_NAME)}</div>
+                    <div class="lp-tagline">Tech store · Since 2026</div>
+                  </div>
+                </div>
+                """),
+                unsafe_allow_html=True,
+            )
+            # Nút trong suốt phủ lên logo: về trang chủ KHÔNG tải lại trang (giữ giỏ hàng & đăng nhập)
+            st.button("Về trang chủ", key="brand_home", on_click=go, args=("home",))
 
     if show_filters and c_search is not None and c_flt is not None:
         c_search.text_input(
@@ -3768,7 +3937,6 @@ def page_auth() -> None:
                         flash(f"Chào mừng {x['fullname']}!", "👋")
                         go({"admin": "admin", "staff": "staff"}.get(x["role"], "home"))
                         st.rerun()
-            st.caption("Tài khoản có sẵn: `demo / demo123` (Khách hàng · Có sẵn 5.000.000₫) · `admin / admin123` (Quản trị viên)")
 
         else:
             social_buttons("register", "Đăng ký với")
@@ -5078,5 +5246,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-sync_auth_cookie()
-sync_page_url()
+_cookie_js = sync_auth_cookie()
+_hist_js = sync_page_url()
+# Nút ẩn: JS bấm vào đây khi người dùng Back/Forward để app đọc lại URL; khối ẩn chứa JS của app.
+with st.container(key="lpbridge"):
+    st.button("nav", key="lp_nav_bridge")
+with st.container(key="lpjs"):
+    _run_js(_cookie_js + _hist_js)

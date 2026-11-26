@@ -1835,6 +1835,18 @@ def make_sku(brand: str, series: str, color: str) -> str:
     return "-".join(x for x in (BRAND_CODES.get(brand, "XX"), s_clean, color) if x)
 
 
+def split_sku(sku: str) -> tuple[str, str, str]:
+    """Tách SKU thành (mã hãng, mã dòng, mã màu). VD: AP-MBP16M5X-01-G → ('AP', 'MBP16M5X-01', 'G')."""
+    parts = [x for x in str(sku or "").strip().upper().split("-") if x]
+    if not parts:
+        return "", "", ""
+    prefix, rest = parts[0], parts[1:]
+    color = rest[-1] if rest and rest[-1] in COLOR_RULES else ""
+    if color:
+        rest = rest[:-1]
+    return prefix, "-".join(rest), color
+
+
 def final_price(base: int, color: str) -> int:
     return int(round(base * (1 + (COLOR_RULES[color][1] if color else 0))))
 
@@ -2054,7 +2066,7 @@ def update_display_name(new_name: str) -> tuple[bool, str]:
 
 # ---------- sản phẩm do staff đề xuất ----------
 SPEC_FIELDS = ("name", "brand", "cpu", "ram", "gpu", "ssd", "screen", "os")
-EDIT_LABELS = {"name": "Tên máy", "brand": "Hãng", "price": "Giá bán", "cpu": "CPU", "ram": "RAM", "gpu": "GPU", "ssd": "Lưu trữ", "screen": "Màn hình", "os": "Hệ điều hành", "description": "Mô tả", "image": "Ảnh sản phẩm"}
+EDIT_LABELS = {"sku": "Mã SKU", "name": "Tên máy", "brand": "Hãng", "price": "Giá bán", "cpu": "CPU", "ram": "RAM", "gpu": "GPU", "ssd": "Lưu trữ", "screen": "Màn hình", "os": "Hệ điều hành", "description": "Mô tả", "image": "Ảnh sản phẩm"}
 
 
 def _norm(v) -> str:
@@ -2137,7 +2149,7 @@ def submit_product_request(f: dict, img_bytes: bytes | None, img_name: str) -> t
     return True, f"Đã gửi đề xuất {sku}. Sản phẩm sẽ vào kho sau khi Admin duyệt."
 
 
-EDIT_FIELDS = ("name", "brand", "price", "cpu", "ram", "gpu", "ssd", "screen", "os", "description")
+EDIT_FIELDS = ("sku", "name", "brand", "price", "cpu", "ram", "gpu", "ssd", "screen", "os", "description")
 
 
 def submit_edit_request(lid: int, new: dict, img_bytes: bytes | None, reason: str) -> tuple[bool, str]:
@@ -2157,6 +2169,17 @@ def submit_edit_request(lid: int, new: dict, img_bytes: bytes | None, reason: st
         if ((prq["status"] == ST_PRQ_PENDING) & (prq["kind"] == "edit") & (prq["target_id"].astype(str) == str(lid))).any():
             return False, "Sản phẩm này đã có một yêu cầu chỉnh sửa đang chờ Admin duyệt."
         merged, changes = {k: str(cur[k]) for k in LAP_COLS}, {}
+        new_sku = str(new.get("sku") or cur["sku"]).strip().upper()
+        if new_sku != str(cur["sku"]).strip().upper():
+            if (lap["sku"].str.upper() == new_sku).any():
+                return False, f"Mã SKU `{new_sku}` đã có trong kho. Hãy đổi mã dòng (VD: thêm số thứ tự `-02`)."
+            others = prq[(prq["status"] == ST_PRQ_PENDING) & (prq["kind"] != "edit")]
+            if (others["sku"].str.upper() == new_sku).any():
+                return False, f"Đã có một đề xuất sản phẩm mới dùng SKU `{new_sku}` đang chờ duyệt."
+            for _, q in prq[(prq["status"] == ST_PRQ_PENDING) & (prq["kind"] == "edit")].iterrows():
+                if str(_changes_of(q).get("sku", {}).get("new", "")).upper() == new_sku:
+                    return False, f"Đã có một yêu cầu chỉnh sửa khác đang chờ duyệt dùng SKU `{new_sku}`."
+        new["sku"] = new_sku
         for fld in EDIT_FIELDS:
             old = str(cur[fld]).strip()
             nv = str(int(new["price"])) if fld == "price" else str(new[fld]).strip()
@@ -2216,8 +2239,13 @@ def approve_product(rid: int) -> None:
                 changes = {}
             merged = {k: str(lap[tm].iloc[0][k]) for k in LAP_COLS}
             for fld, ch in changes.items():
-                if fld in merged and fld not in ("id", "sku", "image"):
+                if fld in merged and fld not in ("id", "image"):
                     merged[fld] = str(ch.get("new", merged[fld]))
+            old_sku = str(lap[tm].iloc[0]["sku"])
+            sku_changed = merged["sku"].upper() != old_sku.upper()
+            if sku_changed and (lap[~tm]["sku"].str.upper() == merged["sku"].upper()).any():
+                flash(f"SKU {merged['sku']} đã tồn tại trong kho, hãy từ chối yêu cầu này.", "⚠️")
+                return
             clash = find_same_product(merged, lap, exclude_id=tid)
             if clash is not None:
                 flash(f"Sau khi sửa sẽ trùng hoàn toàn với {clash['sku']}, không thể duyệt.", "⚠️")
@@ -2232,6 +2260,12 @@ def approve_product(rid: int) -> None:
                 if k != "id":
                     lap.loc[tm, k] = merged[k]
             write_csv(lap, F_LAP)
+            if sku_changed:  # giá đối thủ gắn theo SKU → đổi theo để không mất dữ liệu so sánh
+                cmp_all = read_csv(F_CMP, CMP_COLS)
+                cm = cmp_all["sku"].str.upper() == old_sku.upper()
+                if cm.any():
+                    cmp_all.loc[cm, "sku"] = merged["sku"].upper()
+                    write_csv(cmp_all, F_CMP)
             for k, v in (("status", ST_PRQ_OK), ("reviewed_by", ss.user["username"]), ("reviewed_at", now_str), ("laptop_id", tid)):
                 prq.loc[m, k] = v
             write_csv(prq, F_PRQ)
@@ -4614,6 +4648,13 @@ def staff_edit_tab() -> None:
         name = a1.text_input("Tên máy", value=str(cur["name"]), key=k + "name")
         brand = a2.selectbox("Hãng", brands, index=brands.index(str(cur["brand"])), key=k + "brand")
         price = a3.number_input("Giá bán (₫)", min_value=0, step=100_000, value=int(cur["price"]), key=k + "price")
+        cur_prefix, cur_series, cur_color = split_sku(cur["sku"])
+        colors = _opts(["", *COLOR_RULES.keys()], cur_color)
+        s1, s2 = st.columns([1, 1])
+        series = s1.text_input("Mã dòng (viết hoa)", value=cur_series, placeholder="MBA13M5 hoặc ROG16-01", key=k + "series")
+        color = s2.selectbox("Mã màu", colors, index=colors.index(cur_color), key=k + "color",
+                             format_func=lambda c: "Không áp dụng mã màu" if not c else (f"{c} — {COLOR_RULES[c][0]} (+{int(COLOR_RULES[c][1]*100)}%)" if c in COLOR_RULES else c))
+        st.caption(f"SKU hiện tại: `{cur['sku']}`. Đổi Mã dòng / Mã màu / Hãng sẽ sinh SKU mới; nếu đổi màu mà không sửa giá, giá tự cộng theo màu mới.")
         b1, b2, b3, b4 = st.columns(4)
         cpu = b1.text_input("CPU", value=str(cur["cpu"]), key=k + "cpu")
         gpu = b2.text_input("GPU", value=str(cur["gpu"]), key=k + "gpu")
@@ -4631,8 +4672,16 @@ def staff_edit_tab() -> None:
             st.error("Vui lòng nhập lý do chỉnh sửa để Admin dễ xem xét.")
         elif not (name.strip() and cpu.strip() and screen.strip()):
             st.error("Tên máy, CPU và Màn hình không được để trống.")
+        elif not re.sub(r"[^A-Z0-9-]", "", series.strip().upper()):
+            st.error("Mã dòng không được để trống.")
         else:
-            new = {"name": name, "brand": brand, "price": int(price), "cpu": cpu, "ram": ram, "gpu": gpu, "ssd": ssd, "screen": screen, "os": os_name, "description": desc}
+            s_clean = re.sub(r"[^A-Z0-9-]", "", series.strip().upper())
+            prefix = cur_prefix if brand == str(cur["brand"]) else BRAND_CODES.get(brand, "XX")
+            new_sku = "-".join(x for x in (prefix, s_clean, color) if x)
+            if color != cur_color and int(price) == int(cur["price"]) and cur_color in (*COLOR_RULES, ""):
+                base_price = int(cur["price"]) / (1 + (COLOR_RULES[cur_color][1] if cur_color else 0))
+                price = final_price(int(round(base_price)), color) if color in COLOR_RULES or color == "" else price
+            new = {"sku": new_sku, "name": name, "brand": brand, "price": int(price), "cpu": cpu, "ram": ram, "gpu": gpu, "ssd": ssd, "screen": screen, "os": os_name, "description": desc}
             done, msg = submit_edit_request(lid, new, up.getvalue() if up else None, reason.strip())
             if done:
                 flash(msg, "📨")

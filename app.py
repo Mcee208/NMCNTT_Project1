@@ -2336,9 +2336,8 @@ def run_bulk(action: str) -> None:
             ok += 1
         else:
             errors.append(f"#{rid}: " + (new[-1][0] if new else "không thực hiện được"))
-        ss[f"prq_sel_{rid}"] = False
         pb.progress(i / len(ids), text=f"{verb} {i}/{len(ids)}…")
-    ss["prq_sel_all"] = False
+    ss["_prq_clear_sel"] = True  # bỏ tick ở lần chạy sau, trước khi các checkbox được vẽ (không được gán key của widget đã vẽ)
     pb.empty()
     flash(f"Đã {'duyệt' if action == 'approve' else 'từ chối'} {ok}/{len(ids)} yêu cầu.", "✅" if action == "approve" else "❌")
     for e in errors:
@@ -4765,6 +4764,9 @@ def _edit_diff_html(r, lap: pd.DataFrame) -> str:
 def _prq_review_list() -> None:
     """Danh sách duyệt là fragment: tick chọn / đổi giá chỉ vẽ lại phần này, không chạy lại cả trang Admin
     (nhanh hơn, không nhảy lên đầu trang). Chỉ khi duyệt / từ chối mới st.rerun() toàn trang để cập nhật số chờ duyệt."""
+    if ss.pop("_prq_clear_sel", False):
+        for k in [k for k in ss.keys() if str(k).startswith("prq_sel_")]:
+            ss[k] = False
     prq = read_csv(F_PRQ, PRQ_COLS)
     lap = load_laptops()
     pend = prq[prq["status"] == ST_PRQ_PENDING]

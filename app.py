@@ -3143,6 +3143,52 @@ CSS_FIX = """
 [data-testid='stLayoutWrapper']:has(>.st-key-lpbridge),[data-testid='stLayoutWrapper']:has(>.st-key-lpjs),
 .st-key-lpbridge,.st-key-lpjs{position:absolute!important;width:1px!important;height:1px!important;overflow:hidden!important;opacity:0!important;pointer-events:none!important;margin:0!important;padding:0!important;}
 
+
+/* ===== HIỆU ỨNG MỚI (v2) ===== */
+/* Thanh tiến trình cuộn trang */
+.stApp::before{content:"";position:fixed;left:0;top:0;height:3px;width:100%;z-index:2000;transform-origin:0 50%;transform:scaleX(0);
+  background:linear-gradient(90deg,#4cc9f0,#6d7cff,#d6b4ff);box-shadow:0 0 12px rgba(76,201,240,.7);pointer-events:none;}
+@supports (animation-timeline:scroll()){.stApp::before{animation:lp-progress linear both;animation-timeline:scroll(root);}}
+@keyframes lp-progress{to{transform:scaleX(1)}}
+
+/* Ánh sáng đi theo con trỏ trên thẻ sản phẩm */
+[class*='st-key-card_']::before{content:"";position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .3s ease;z-index:1;
+  background:radial-gradient(260px circle at var(--mx,50%) var(--my,50%),rgba(125,211,252,.20),transparent 60%);}
+[class*='st-key-card_']:hover::before{opacity:1;}
+
+/* Chuyển tab / mục mượt */
+[class*='st-key-admin_tab_pane_'],[class*='st-key-staff_tab_pane_']{animation:lp-tab-in .45s cubic-bezier(.22,1,.36,1) both;}
+@keyframes lp-tab-in{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+[class*='st-key-admin_tab'] [role='radiogroup'],[class*='st-key-staff_tab'] [role='radiogroup']{flex-wrap:wrap;gap:8px;}
+
+/* Nút bấm: nảy nhẹ khi nhấn, sáng khi rê chuột */
+.stApp button{transition:transform .18s cubic-bezier(.22,1,.36,1),box-shadow .25s ease,filter .25s ease,border-color .25s ease!important;}
+.stApp button:not(:disabled):hover{transform:translateY(-2px);filter:brightness(1.08);}
+.stApp button:not(:disabled):active{transform:translateY(0) scale(.96);}
+.stApp button[kind='primary']:not(:disabled):hover,.stApp [data-testid='stBaseButton-primary']:not(:disabled):hover{box-shadow:0 10px 28px rgba(76,201,240,.45)!important;}
+.st-key-brand_home button:hover{transform:none!important;filter:none!important;}
+
+/* Thẻ số liệu, form, expander nâng nhẹ khi rê chuột */
+[data-testid='stMetric']{transition:transform .25s ease,border-color .25s ease,box-shadow .25s ease;}
+[data-testid='stMetric']:hover{transform:translateY(-3px);border-color:rgba(125,211,252,.55);box-shadow:0 14px 30px rgba(76,201,240,.18);}
+[data-testid='stExpander']{transition:border-color .25s ease,box-shadow .25s ease;}
+[data-testid='stExpander']:hover{border-color:rgba(125,211,252,.5)!important;box-shadow:0 10px 26px rgba(0,0,0,.35);}
+
+/* Thông báo xuất hiện có hiệu ứng trượt */
+[data-testid='stAlert']{animation:lp-pop .4s cubic-bezier(.22,1,.36,1) both;}
+[data-testid='stToast']{animation:lp-pop .45s cubic-bezier(.34,1.56,.64,1) both;}
+@keyframes lp-pop{from{opacity:0;transform:translateY(10px) scale(.97)}to{opacity:1;transform:none}}
+
+/* Khi app đang tải lại: mờ nhẹ thay vì nhảy */
+[data-stale='true']{opacity:.62!important;transition:opacity .25s ease;}
+
+/* Ô nhập: viền sáng khi focus */
+.stApp input:focus,.stApp textarea:focus{box-shadow:0 0 0 3px rgba(76,201,240,.28)!important;}
+
+/* Ảnh sản phẩm hiện dần */
+.lp-imgwrap img,.lp-detail-img img{animation:lp-img-in .6s ease both;}
+@keyframes lp-img-in{from{opacity:0;filter:blur(8px)}to{opacity:1;filter:none}}
+
 /* 5) Tôn trọng người dùng tắt hiệu ứng chuyển động */
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important;}}
 """
@@ -4094,6 +4140,23 @@ def staff_queue() -> None:
                 st.rerun()
 
 
+def persistent_tabs(labels: list[str], key: str) -> list:
+    """Thay st.tabs: tab đang chọn được lưu trong session_state nên sau mỗi lần rerun
+    (duyệt sản phẩm, duyệt nạp tiền, lưu cài đặt...) người dùng vẫn ở đúng tab đang làm."""
+    n = len(labels)
+    if not isinstance(ss.get(key), int) or not 0 <= ss[key] < n:
+        ss[key] = 0
+    sel = st.radio("Chọn mục", list(range(n)), format_func=lambda i: labels[i], horizontal=True, key=key, label_visibility="collapsed")
+    panes = [st.container(key=f"{key}_pane_{i}") for i in range(n)]
+    hide = ",".join(
+        f"[data-testid='stElementContainer']:has(>.st-key-{key}_pane_{i}),[data-testid='stLayoutWrapper']:has(>.st-key-{key}_pane_{i}),.st-key-{key}_pane_{i}"
+        for i in range(n) if i != sel
+    )
+    if hide:
+        st.markdown(f"<style>{hide}{{display:none!important}}</style>", unsafe_allow_html=True)
+    return panes
+
+
 def page_staff() -> None:
     role = ss.user["role"] if ss.user else ""
     if role not in ("staff", "admin"):
@@ -4129,7 +4192,7 @@ def page_staff() -> None:
         + (f"Hạn mức mỗi giao dịch của nhân viên: {vnd(limit)}." if role == "staff" else "")
     )
 
-    tabs = st.tabs(["📥 Xử lý đơn", "📒 Sao kê cá nhân"] + (["🔐 Tài khoản", "📜 Lịch sử toàn hệ thống"] if role == "admin" else ["➕ Thêm sản phẩm", "✏️ Sửa sản phẩm"]))
+    tabs = persistent_tabs(["📥 Xử lý đơn", "📒 Sao kê cá nhân"] + (["🔐 Tài khoản", "📜 Lịch sử toàn hệ thống"] if role == "admin" else ["➕ Thêm sản phẩm", "✏️ Sửa sản phẩm"]), "staff_tab")
     tab_work, tab_stmt = tabs[0], tabs[1]
 
     with tab_work:
@@ -4971,7 +5034,7 @@ def page_admin() -> None:
     st.write("")
 
     _n_prq = int((read_csv(F_PRQ, PRQ_COLS)["status"] == ST_PRQ_PENDING).sum())
-    tab_prod, tab_vch, tab_usr, tab_ord, tab_top, tab_staff, tab_set, tab_prq, tab_cmp, tab_prof = st.tabs([
+    tab_prod, tab_vch, tab_usr, tab_ord, tab_top, tab_staff, tab_set, tab_prq, tab_cmp, tab_prof = persistent_tabs([
         "💻 Quản lý Sản phẩm & SKU",
         "🎟️ Quản lý Mã giảm giá",
         "👥 Quản lý Người dùng",
@@ -4982,7 +5045,7 @@ def page_admin() -> None:
         f"📥 Duyệt sản phẩm ({_n_prq})",
         "🤖 So sánh giá (AI)",
         "🔐 Tài khoản & Giao diện",
-    ])
+    ], "admin_tab")
 
     with tab_prod:
         st.subheader("➕ Thêm sản phẩm mới (Tự động sinh mã SKU & cộng giá theo màu)")
@@ -5268,10 +5331,18 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+_FX_JS = (
+    "if(!P.__lpfx){P.__lpfx=true;let raf=0;"
+    "P.document.addEventListener('pointermove',function(e){"
+    "const t=e.target&&e.target.closest?e.target.closest(\"[class*='st-key-card_']\"):null;if(!t||raf)return;"
+    "raf=P.requestAnimationFrame(function(){raf=0;const r=t.getBoundingClientRect();"
+    "t.style.setProperty('--mx',(e.clientX-r.left)+'px');t.style.setProperty('--my',(e.clientY-r.top)+'px');});"
+    "},{passive:true});}"
+)
 _cookie_js = sync_auth_cookie()
 _hist_js = sync_page_url()
 # Nút ẩn: JS bấm vào đây khi người dùng Back/Forward để app đọc lại URL; khối ẩn chứa JS của app.
 with st.container(key="lpbridge"):
     st.button("nav", key="lp_nav_bridge")
 with st.container(key="lpjs"):
-    _run_js(_cookie_js + _hist_js)
+    _run_js(_cookie_js + _hist_js + _FX_JS)

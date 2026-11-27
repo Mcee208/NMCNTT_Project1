@@ -578,6 +578,11 @@ def flash(msg: str, icon: str = "✅") -> None:
 
 
 def go(page: str, detail_id: int | None = None, auth_mode: str | None = None) -> None:
+    # Khách bị chặn ở bước đặt hàng → sau khi đăng nhập / đăng ký xong quay lại đúng giỏ hàng
+    if page == "home" and ss.get("login_return") and ss.get("user") and ss.user.get("role") == "user":
+        page = ss.pop("login_return")
+    elif page != "auth":
+        ss.pop("login_return", None)
     ss.page = page
     if detail_id is not None:
         ss.detail_id = int(detail_id)
@@ -585,6 +590,11 @@ def go(page: str, detail_id: int | None = None, auth_mode: str | None = None) ->
         ss.auth_mode = auth_mode
     if page != "cart":
         ss.order_done = None
+
+
+def login_to_order(mode: str = "login") -> None:
+    ss["login_return"] = "cart"
+    go("auth", None, mode)
 
 
 def set_topup_amount(amt: int) -> None:
@@ -3911,6 +3921,13 @@ def page_cart() -> None:
             if ss.user:
                 pay_opts.append(f"Số dư tài khoản ({vnd(user_bal)})")
 
+            if not ss.user:
+                st.warning("🔒 Bạn cần đăng nhập để đặt hàng. Giỏ hàng của bạn vẫn được giữ nguyên sau khi đăng nhập.")
+                lg1, lg2 = st.columns(2)
+                lg1.button("🔑 Đăng nhập", key="cart_login", type="primary", on_click=login_to_order, args=("login",), use_container_width=True)
+                lg2.button("📝 Đăng ký", key="cart_register", on_click=login_to_order, args=("register",), use_container_width=True)
+                return
+
             with st.form("checkout"):
                 pay_method = st.radio("Phương thức thanh toán", pay_opts)
                 name = st.text_input("Họ và tên", value=ss.user["fullname"] if ss.user else "")
@@ -3918,6 +3935,9 @@ def page_cart() -> None:
                 addr = st.text_area("Địa chỉ giao hàng", height=80, placeholder="Số nhà, đường, phường, quận/thành phố")
                 go_order = st.form_submit_button("✅ Xác nhận đặt hàng", type="primary", use_container_width=True)
             if go_order:
+                if not ss.user:  # chặn thêm ở phía xử lý, phòng khi phiên đăng nhập hết hạn giữa chừng
+                    st.error("Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại để đặt hàng.")
+                    st.stop()
                 phone_s = phone.strip().replace(" ", "")
                 use_wallet = "Số dư tài khoản" in pay_method
                 if not name.strip() or not phone_s or not addr.strip():

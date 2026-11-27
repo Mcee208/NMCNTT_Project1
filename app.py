@@ -1523,6 +1523,13 @@ def storage_upload(bucket: str, object_path: str, data: bytes, content_type: str
     get_supabase().storage.from_(bucket).upload(object_path, data, file_options=options)
 
 
+def storage_err_text(e: Exception) -> str:
+    """Rút gọn lỗi Supabase Storage thành 'mã trạng thái - thông điệp' để hiển thị / ghi log (Streamlit Cloud ẩn chi tiết lỗi gốc)."""
+    status = getattr(e, "status", None) or getattr(e, "statusCode", None) or ""
+    msg = getattr(e, "message", None) or str(e) or type(e).__name__
+    return f"{type(e).__name__} {status} - {msg}".strip()
+
+
 def storage_download(bucket: str, object_path: str) -> bytes | None:
     try:
         return get_supabase().storage.from_(bucket).download(object_path)
@@ -1737,7 +1744,13 @@ def submit_topup(uname: str, amount: int, memo: str, data: bytes) -> tuple[bool,
         fname = f"{tid}_{info['sha256'][:10]}" + {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}[info["fmt"]]
         proof_file = PROOF_DIR / fname
         proof_file.write_bytes(data)
-        upload_proof_file(proof_file)
+        try:
+            upload_proof_file(proof_file)
+        except Exception as e:  # lỗi Storage (thiếu bucket / thiếu quyền / sai key...): báo rõ thay vì làm sập trang
+            proof_file.unlink(missing_ok=True)
+            detail = storage_err_text(e)
+            print(f"[submit_topup] upload proofs/{fname} lỗi: {detail}", flush=True)
+            return False, f"Không lưu được ảnh biên lai lên kho lưu trữ ({detail}). Vui lòng thử lại hoặc báo quản trị viên."
         flags = ("EDIT:" + ", ".join(info["edit"])) if info["edit"] else ""
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         new = pd.DataFrame(

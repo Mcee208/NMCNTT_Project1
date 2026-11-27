@@ -1520,7 +1520,15 @@ def storage_upload(bucket: str, object_path: str, data: bytes, content_type: str
     options = {"upsert": "true"}
     if content_type:
         options["content-type"] = content_type
-    get_supabase().storage.from_(bucket).upload(object_path, data, file_options=options)
+    bucket_api = get_supabase().storage.from_(bucket)
+    try:
+        bucket_api.upload(object_path, data, file_options=options)
+    except Exception as e:
+        # 415: bucket chưa cho phép image/webp → thử lại với nhãn image/png (nội dung giữ nguyên, app vẫn đọc bình thường)
+        if content_type == "image/webp" and ("415" in str(e) or "not supported" in str(e).lower()):
+            bucket_api.upload(object_path, data, file_options={**options, "content-type": "image/png"})
+        else:
+            raise
 
 
 def storage_err_text(e: Exception) -> str:
@@ -1565,11 +1573,14 @@ def upload_proof_file(local_path: Path) -> None:
 def sync_local_images_to_storage() -> None:
     # Đồng bộ ảnh tĩnh đã có trong repository lên bucket public đúng một lần mỗi worker.
     try:
-        for file in IMG_DIR.rglob("*"):
-            if file.is_file():
-                upload_image_file(file, file.relative_to(IMG_DIR).as_posix())
+        files = [f for f in IMG_DIR.rglob("*") if f.is_file()]
     except Exception:
-        pass
+        return
+    for file in files:  # lỗi một file không được làm dừng cả đợt đồng bộ
+        try:
+            upload_image_file(file, file.relative_to(IMG_DIR).as_posix())
+        except Exception:
+            continue
 
 
 def min_topup() -> int:

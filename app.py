@@ -1963,6 +1963,8 @@ def load_competitors() -> pd.DataFrame:
 
 def upsert_competitors(rows: list[tuple[str, str, int, str]], who: str) -> int:
     """rows: (sku, store, price, url). Cập nhật nếu đã có cùng sku+store, ngược lại thêm mới."""
+    if not _is_reviewer():
+        return 0
     today = date.today().strftime("%Y-%m-%d")
     with topup_lock():
         df = _read_csv_raw(F_CMP, CMP_COLS)
@@ -4420,28 +4422,53 @@ ADMIN_SECTIONS = {
 }
 
 
-def _set_admin_tab(i: int) -> None:
-    ss["admin_tab"] = i
+def _set_admin_tab(i: int, tab_key: str = "admin_tab") -> None:
+    ss[tab_key] = i
 
 
-def admin_shell(badges: dict) -> list:
-    """Menu dọc chia nhóm bên trái + vùng nội dung bên phải. Trả về 10 container (chỉ container của mục đang mở được vẽ nội dung)."""
-    if not isinstance(ss.get("admin_tab"), int) or not 0 <= ss["admin_tab"] < len(ADMIN_SECTIONS):
-        ss["admin_tab"] = 0
-    sel = ss["admin_tab"]
+def admin_shell(badges: dict, nav_def=None, sections=None, tab_key: str = "admin_tab") -> list:
+    """Menu dọc chia nhóm bên trái (cuộn riêng) + vùng nội dung bên phải. Dùng chung cho cổng Admin và cổng Staff.
+    Trả về danh sách container theo thứ tự mục (chỉ container của mục đang mở được vẽ nội dung)."""
+    nav_def = ADMIN_NAV if nav_def is None else nav_def
+    sections = ADMIN_SECTIONS if sections is None else sections
+    if not isinstance(ss.get(tab_key), int) or ss[tab_key] not in sections:
+        ss[tab_key] = 0
+    sel = ss[tab_key]
     nav, main = st.columns([1, 4.3], gap="large")
     with nav:
         with st.container(key="admin_nav"):
-            for grp, items in ADMIN_NAV:
+            for grp, items in nav_def:
                 st.markdown(f'<div class="adm-grp">{esc(grp)}</div>', unsafe_allow_html=True)
                 for i, ic, lb in items:
                     n = int(badges.get(i, 0) or 0)
-                    with st.container(key=f"admnav_{i}_{'on' if i == sel else 'off'}"):
-                        st.button(f"{ic}  {lb}" + (f"   ●  {n}" if n else ""), key=f"admnav_btn_{i}", on_click=_set_admin_tab, args=(i,), use_container_width=True)
+                    with st.container(key=f"admnav_{tab_key}_{i}_{'on' if i == sel else 'off'}"):
+                        st.button(f"{ic}  {lb}" + (f"   ●  {n}" if n else ""), key=f"admnav_btn_{tab_key}_{i}", on_click=_set_admin_tab, args=(i, tab_key), use_container_width=True)
     with main:
-        ic, title, desc, tone = ADMIN_SECTIONS[sel]
+        ic, title, desc, tone = sections[sel]
         section_head(ic, title, desc, tone)
-        return [st.container(key=f"admin_tab_pane_{i}") for i in range(len(ADMIN_SECTIONS))]
+        return [st.container(key=f"{tab_key}_pane_{i}") for i in range(max(sections) + 1)]
+
+
+STAFF_NAV = [
+    ("Nạp tiền", [(0, "📥", "Xử lý đơn"), (1, "📒", "Sao kê cá nhân")]),
+    ("Sản phẩm", [(2, "➕", "Thêm sản phẩm"), (3, "✏️", "Sửa sản phẩm"), (4, "🤖", "So sánh giá (AI)")]),
+]
+STAFF_NAV_ADMIN = [
+    ("Nạp tiền", [(0, "📥", "Xử lý đơn"), (1, "📒", "Sao kê cá nhân")]),
+    ("Hệ thống", [(2, "🔐", "Tài khoản"), (3, "📜", "Lịch sử toàn hệ thống")]),
+]
+STAFF_SECTIONS = {
+    0: ("📥", "Xử lý đơn nạp tiền", "Nhận đơn ở hàng chờ, đối chiếu biên lai với app ngân hàng rồi xác nhận cộng tiền.", "amber"),
+    1: ("📒", "Sao kê cá nhân", "Tổng kết các đơn bạn đã xử lý theo từng ngày.", "green"),
+    2: ("➕", "Thêm sản phẩm", "Đề xuất sản phẩm mới, Admin sẽ duyệt trước khi đưa lên kho.", "cyan"),
+    3: ("✏️", "Sửa sản phẩm", "Gửi yêu cầu chỉnh sửa thông tin, giá hoặc mã SKU; Admin duyệt rồi mới cập nhật.", "violet"),
+    4: ("🤖", "So sánh giá (AI)", "Nhập giá đối thủ (kèm link nguồn) để AI tư vấn trả lời chính xác.", "cyan"),
+}
+STAFF_SECTIONS_ADMIN = {
+    **{k: STAFF_SECTIONS[k] for k in (0, 1)},
+    2: ("🔐", "Tài khoản", "Đổi mật khẩu đăng nhập.", "pink"),
+    3: ("📜", "Lịch sử toàn hệ thống", "Mọi giao dịch nạp tiền đã được xử lý.", "violet"),
+}
 
 
 def page_staff() -> None:
@@ -4468,22 +4495,26 @@ def page_staff() -> None:
         if _me.empty or not _me.iloc[0]["phone"]:
             st.warning("📵 Bạn chưa cập nhật số điện thoại nên khách hàng chưa liên hệ được với bạn ở trang Hỗ trợ.")
         st.button("👤 Thông tin cá nhân", key="staff_to_profile", on_click=go, args=("staff_profile",))
-    stat_cards([
-        {"label": "Đơn đang chờ nhận", "value": n_wait, "icon": "⏳", "tone": "amber", "hero": True},
-        {"label": "Tôi đang xử lý", "value": len(mine), "icon": "🛠️", "tone": "violet"},
-        {"label": "Tôi đã duyệt hôm nay", "value": len(ok_today), "icon": "✅", "tone": "green"},
-        {"label": "Tiền tôi đã duyệt hôm nay", "value": int(pd.to_numeric(ok_today["amount"], errors="coerce").fillna(0).sum()), "money": True, "icon": "💰", "tone": "cyan", "hero": True},
-    ])
-    st.caption(
-        f"Quy trình: **nhận đơn** ở Hàng chờ → mở app ngân hàng đối chiếu **số tiền**, **nội dung chuyển khoản**, **thời gian** → tick xác nhận → cộng tiền. "
-        f"Mỗi người giữ tối đa {MAX_CLAIMS} đơn, đơn giữ quá {CLAIM_TTL_MIN} phút không xử lý sẽ quay lại hàng chờ. "
-        + (f"Hạn mức mỗi giao dịch của nhân viên: {vnd(limit)}." if role == "staff" else "")
-    )
-
-    tabs = persistent_tabs(["📥 Xử lý đơn", "📒 Sao kê cá nhân"] + (["🔐 Tài khoản", "📜 Lịch sử toàn hệ thống"] if role == "admin" else ["➕ Thêm sản phẩm", "✏️ Sửa sản phẩm"]), "staff_tab")
+    if role == "admin":
+        tabs = admin_shell({0: n_wait}, STAFF_NAV_ADMIN, STAFF_SECTIONS_ADMIN, "staff_tab")
+    else:
+        tabs = admin_shell({0: n_wait}, STAFF_NAV, STAFF_SECTIONS, "staff_tab")
     tab_work, tab_stmt = tabs[0], tabs[1]
 
-    with tab_work:
+    for _ in lazy_pane(tab_work, "staff_tab", 0):
+        stat_cards([
+            {"label": "Đơn đang chờ nhận", "value": n_wait, "icon": "⏳", "tone": "amber", "hero": True},
+            {"label": "Tôi đang xử lý", "value": len(mine), "icon": "🛠️", "tone": "violet"},
+            {"label": "Tôi đã duyệt hôm nay", "value": len(ok_today), "icon": "✅", "tone": "green"},
+            {"label": "Tiền tôi đã duyệt hôm nay", "value": int(pd.to_numeric(ok_today["amount"], errors="coerce").fillna(0).sum()), "money": True, "icon": "💰", "tone": "cyan", "hero": True},
+        ])
+        st.caption(
+            f"Quy trình: **nhận đơn** ở Hàng chờ → mở app ngân hàng đối chiếu **số tiền**, **nội dung chuyển khoản**, **thời gian** → tick xác nhận → cộng tiền. "
+            f"Mỗi người giữ tối đa {MAX_CLAIMS} đơn, đơn giữ quá {CLAIM_TTL_MIN} phút không xử lý sẽ quay lại hàng chờ. "
+            + (f"Hạn mức mỗi giao dịch của nhân viên: {vnd(limit)}." if role == "staff" else "")
+        )
+
+
         st.subheader(f"🛠️ Đơn tôi đang xử lý ({len(mine)})")
         if mine.empty:
             st.caption("Bạn chưa nhận đơn nào. Chọn một đơn ở Hàng chờ bên dưới.")
@@ -4546,23 +4577,25 @@ def page_staff() -> None:
         st.subheader("⏳ Hàng chờ")
         staff_queue()
 
-    with tab_stmt:
+    for _ in lazy_pane(tab_stmt, "staff_tab", 1):
         st.markdown("**Sao kê cá nhân – tổng kết cuối ngày**")
         day = st.date_input("Chọn ngày", value=date.today(), key="stmt_day_staff")
         render_statement(me, day.strftime("%Y-%m-%d"), "me")
 
     if role == "staff":
-        with tabs[2]:
+        for _ in lazy_pane(tabs[2], "staff_tab", 2):
             staff_product_tab()
-        with tabs[3]:
+        for _ in lazy_pane(tabs[3], "staff_tab", 3):
             staff_edit_tab()
+        for _ in lazy_pane(tabs[4], "staff_tab", 4):
+            admin_compare_tab()
     if role == "admin":
-        with tabs[2]:
+        for _ in lazy_pane(tabs[2], "staff_tab", 2):
             st.subheader("🔐 Đổi mật khẩu")
             password_panel("stf")
 
     if role == "admin":
-        with tabs[3]:
+        for _ in lazy_pane(tabs[3], "staff_tab", 3):
             done = df[df["status"].isin([ST_OK, ST_REJ])].iloc[::-1]
             if done.empty:
                 st.info("Chưa có giao dịch nào được xử lý.")
@@ -5049,6 +5082,9 @@ def admin_products_tab() -> None:
 
 
 def admin_compare_tab() -> None:
+    if not _is_reviewer():
+        st.error("🚫 Chỉ Staff và Admin mới nhập được dữ liệu so sánh giá.")
+        return
     st.subheader("🤖 Dữ liệu so sánh giá cho tính năng AI tư vấn")
     st.info(
         "AI tư vấn **chỉ dùng dữ liệu giá bạn nhập ở đây** (kèm link nguồn và ngày cập nhật) và nói đúng kết quả: rẻ hơn, bằng giá hay cao hơn. "
@@ -5129,6 +5165,9 @@ def admin_compare_tab() -> None:
     v = v[["sku", "Sản phẩm", "store", "Giá đối thủ", "Giá web mình", "url", "updated_at", "updated_by"]]
     v.columns = ["SKU", "Sản phẩm", "Website", "Giá đối thủ", "Giá web mình", "Link", "Cập nhật", "Người nhập"]
     st.dataframe(v, use_container_width=True, hide_index=True)
+    if ss.user["role"] != "admin":
+        st.caption("Muốn xóa một dòng giá, hãy nhờ Admin. Bạn vẫn có thể ghi đè giá bằng cách lưu lại cùng SKU + website.")
+        return
     d1, d2 = st.columns([3, 1], vertical_alignment="bottom")
     keys = [f"{a}|{b}" for a, b in zip(cmp_df["sku"], cmp_df["store"])]
     pick_del = d1.selectbox("Xóa một dòng giá", keys, key="cmp_del_sel", format_func=lambda k: k.replace("|", " – "))

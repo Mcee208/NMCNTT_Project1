@@ -770,8 +770,30 @@ def _restore_cart(snap) -> None:
             ss.cart[lid] = min(qty, 99)
 
 
+_OAUTH_POPUP_COOKIE = "lp_oauth_popup"
+
+
+@st.cache_resource
+def _oauth_store() -> dict:
+    """Bộ nhớ chung của server: phiên cửa sổ pop-up gửi token đăng nhập về cho phiên cửa sổ chính (khóa = nonce của cửa sổ chính)."""
+    return {"handoff": {}}
+
+
+def _my_nonce() -> str:
+    if not ss.get("oauth_nonce"):
+        ss["oauth_nonce"] = secrets.token_hex(12)
+    return ss["oauth_nonce"]
+
+
+def _popup_cookie() -> str:
+    try:
+        return str(st.context.cookies.get(_OAUTH_POPUP_COOKIE, "") or "")
+    except Exception:
+        return ""
+
+
 def make_state(provider: str, link_user: str = "") -> str:
-    payload = {"p": provider, "t": int(time.time()), "n": secrets.token_hex(6), "u": link_user, "c": _cart_snapshot()}
+    payload = {"p": provider, "t": int(time.time()), "n": secrets.token_hex(6), "u": link_user, "c": _cart_snapshot(), "h": _my_nonce()}
     raw = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
     sig = hmac.new(_state_key(), raw.encode(), hashlib.sha256).hexdigest()[:32]
     return f"{raw}.{sig}"
@@ -1012,30 +1034,108 @@ def handle_oauth_callback() -> None:
     denied = bool(qp.get("error") or qp.get("error_description"))
     st.query_params.clear()
     state = verify_state(raw_state)
-    if not state:
-        flash("Phiên đăng nhập mạng xã hội không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.", "⚠️")
+    # Đang chạy trong cửa sổ pop-up do cửa sổ chính mở (cookie đánh dấu khớp nonce trong state)?
+    popup = bool(state) and bool(state.get("h")) and _popup_cookie() == state.get("h")
+
+    def fail(msg: str) -> None:
+        flash(msg, "⚠️")
+        if popup or (not state and _popup_cookie()):
+            ss["_oauth_popup_fail"] = msg
         go("auth")
+
+    if not state:
+        fail("Phiên đăng nhập mạng xã hội không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.")
         return
     provider = state["p"]
     label = PROVIDERS[provider]["label"]
     if denied or not code:
-        flash(f"Bạn đã hủy đăng nhập bằng {label}.", "⚠️")
-        go("auth")
+        fail(f"Bạn đã hủy đăng nhập bằng {label}.")
         return
     try:
         prof = fetch_profile(provider, code)
     except OAuthError as e:
-        flash(f"Không thể xác thực với {label}: {e}", "⚠️")
-        go("auth")
+        fail(f"Không thể xác thực với {label}: {e}")
         return
     except Exception as e:
-        flash(f"Không kết nối được tới {label} ({type(e).__name__}). Vui lòng thử lại.", "⚠️")
-        go("auth")
+        fail(f"Không kết nối được tới {label} ({type(e).__name__}). Vui lòng thử lại.")
         return
     if process_social_profile(provider, prof, state.get("u", "")):
         _restore_cart(state.get("c"))
+        if popup:
+            ss["_oauth_popup"] = state["h"]
     else:
-        go("auth")
+        fail(ss.flash[-1][0] if ss.flash else "Đăng nhập không thành công.")
+
+
+def oauth_popup_page() -> None:
+    """Giao diện tối giản trong cửa sổ pop-up sau khi Google/GitHub chuyển về: báo kết quả, gửi token cho cửa sổ chính rồi tự đóng."""
+    ok = bool(ss.get("_oauth_popup"))
+    js = f"d.cookie='{_OAUTH_POPUP_COOKIE}=; path=/; max-age=0; SameSite=Lax';"
+    if ok:
+        js = sync_auth_cookie() + js
+        if ss.get("auth_token"):
+            _oauth_store()["handoff"][ss["_oauth_popup"]] = (ss.auth_token, time.time())
+        icon, title, msg = "✅", "Đăng nhập thành công", "Cửa sổ này sẽ tự đóng. Nếu không tự đóng, bạn có thể đóng nó và quay lại trang cửa hàng."
+    else:
+        icon, title, msg = "⚠️", "Chưa đăng nhập được", str(ss.get("_oauth_popup_fail") or "Đã có lỗi xảy ra.") + " Bạn có thể đóng cửa sổ này và thử lại."
+    st.markdown(
+        f'<div style="max-width:420px;margin:12vh auto 0;padding:34px 26px;text-align:center;border-radius:22px;border:1px solid rgba(125,211,252,.4);'
+        f'background:linear-gradient(135deg,rgba(76,201,240,.16),rgba(12,20,42,.92));color:#fff">'
+        f'<div style="font-size:3rem">{icon}</div><div style="font-size:1.35rem;font-weight:800;margin:8px 0">{esc(title)}</div>'
+        f'<div style="color:#a6b8dc;font-size:.95rem">{esc(msg)}</div></div>',
+        unsafe_allow_html=True,
+    )
+    _run_js(js + "setTimeout(function(){try{P.close();}catch(e){}},900);")
+
+
+def _login_from_token(token: str) -> bool:
+    hit = _live_sessions()
+    hit = hit[hit["token_hash"] == _tok_hash(token)]
+    if hit.empty:
+        return False
+    u = read_csv(F_USR, USR_COLS)
+    u = u[u["username"] == hit.iloc[0]["username"]]
+    if u.empty:
+        return False
+    row = u.iloc[0]
+    ss.user = {"username": row["username"], "fullname": row["fullname"], "role": row["role"]}
+    ss.auth_token, ss.auth_user = token, row["username"]
+    return True
+
+
+@st.fragment(run_every=2)
+def oauth_waiter() -> None:
+    """Cửa sổ chính chờ cửa sổ pop-up đăng nhập xong (hỏi server mỗi 2 giây, chỉ khi đang ở trang có nút Google/GitHub)."""
+    rec = _oauth_store()["handoff"].pop(_my_nonce(), None)
+    if not rec or time.time() - rec[1] > 180:
+        return
+    if ss.user is None:
+        if not _login_from_token(rec[0]):
+            return
+        flash("Đăng nhập thành công!", "👋")
+        go({"admin": "admin", "staff": "staff"}.get(ss.user["role"], "home"))
+    st.rerun()
+
+
+def oauth_popup_js() -> str:
+    """JS ở cửa sổ chính (chỉ máy tính): bấm nút Google/GitHub thì mở cửa sổ pop-up thay vì chuyển cả trang.
+    Pop-up bị chặn hoặc là điện thoại thì giữ nguyên cách cũ (chuyển trang). Cookie đánh dấu để pop-up biết nó là pop-up."""
+    n = ss.get("oauth_nonce")
+    if not n:
+        return ""
+    return (
+        f"P.__lpN={json.dumps(n)};"
+        "if(!P.__lpOauth&&!/Android|iPhone|iPad|iPod|Mobile/i.test(P.navigator.userAgent)){P.__lpOauth=true;"
+        "P.document.addEventListener('click',function(e){"
+        "const a=e.target&&e.target.closest?e.target.closest('a.lp-social'):null;if(!a||!a.href)return;"
+        "const w=Math.min(520,P.screen.availWidth-40),h=Math.min(720,P.screen.availHeight-80);"
+        "const l=Math.max(0,Math.round((P.screen.width-w)/2)),t=Math.max(0,Math.round((P.screen.height-h)/2));"
+        "let win=null;try{win=P.open(a.href,'lp_oauth','popup=yes,width='+w+',height='+h+',left='+l+',top='+t);}catch(err){}"
+        "if(win){e.preventDefault();"
+        "P.document.cookie='"+_OAUTH_POPUP_COOKIE+"='+P.__lpN+'; path=/; max-age=300; SameSite=Lax'+(P.location.protocol==='https:'?'; Secure':'');"
+        "try{win.focus();}catch(err){}}"
+        "},true);}"
+    )
 
 
 VALID_PAGES = ("home", "detail", "cart", "auth", "admin", "staff", "advisor", "support", "staff_profile")
@@ -1181,12 +1281,8 @@ def social_buttons(scope: str, verb: str, link_user: str = "") -> None:
             else:
                 with st.container(key=f"soc_{scope}_{key}"):
                     st.button(f"{verb} {meta['label']}", key=f"socb_{scope}_{key}", on_click=set_demo_provider, args=(key,), use_container_width=True)
-    _ready = [k for k in PROVIDERS if provider_ready(k)]
-    if _ready:  # đường dự phòng: mở trang đăng nhập ở TAB MỚI (không phụ thuộc việc trình duyệt cho phép chuyển trang cha)
-        _alts = " · ".join(
-            f'<a href="{esc(build_auth_url(k, link_user))}" target="_blank" rel="noopener noreferrer">{esc(PROVIDERS[k]["label"])}</a>' for k in _ready
-        )
-        st.markdown(f'<div class="lp-soc-alt">Bấm nút mà không chuyển trang? Mở đăng nhập ở tab mới: {_alts}</div>', unsafe_allow_html=True)
+    if any(provider_ready(k) for k in PROVIDERS):
+        oauth_waiter()
     helped = ss.get("social_help")
     if helped and not provider_ready(helped):
         meta = PROVIDERS[helped]
@@ -1256,17 +1352,7 @@ def restore_session() -> None:
         token = str(st.query_params.get(SESSION_QP, "") or "")
     if not token:
         return
-    hit = _live_sessions()
-    hit = hit[hit["token_hash"] == _tok_hash(token)]
-    if hit.empty:
-        return
-    u = read_csv(F_USR, USR_COLS)
-    u = u[u["username"] == hit.iloc[0]["username"]]
-    if u.empty:
-        return
-    row = u.iloc[0]
-    ss.user = {"username": row["username"], "fullname": row["fullname"], "role": row["role"]}
-    ss.auth_token, ss.auth_user = token, row["username"]
+    _login_from_token(token)
 
 
 def _run_js(js: str) -> None:
@@ -3445,6 +3531,9 @@ restore_session()
 restore_page()
 apply_browser_nav()
 handle_oauth_callback()
+if ss.get("_oauth_popup") or ss.get("_oauth_popup_fail"):
+    oauth_popup_page()
+    st.stop()
 handle_nav_query()
 enforce_account_status()
 route_guard()
@@ -4137,6 +4226,8 @@ def account_panel() -> None:
 
         st.markdown("#### 🔗 Liên kết tài khoản")
         st.caption("Liên kết để đăng nhập nhanh bằng Google / GitHub mà không cần nhớ mật khẩu.")
+        if any(provider_ready(k) for k in PROVIDERS):
+            oauth_waiter()
         for key, meta in PROVIDERS.items():
             linked = provider_is_linked(key, me)
             r1, r2 = st.columns([2.4, 1.2], vertical_alignment="center")
@@ -5752,4 +5843,4 @@ _hist_js = sync_page_url()
 with st.container(key="lpbridge"):
     st.button("nav", key="lp_nav_bridge")
 with st.container(key="lpjs"):
-    _run_js(_cookie_js + _hist_js + _FX_JS)
+    _run_js(_cookie_js + _hist_js + _FX_JS + oauth_popup_js())

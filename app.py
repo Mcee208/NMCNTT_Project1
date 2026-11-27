@@ -3358,7 +3358,12 @@ CSS_FIX = """
 .lp-sec .d{display:block;margin-top:3px;font-size:.9rem;color:#a6b8dc;}
 
 /* Menu dọc chia nhóm của Admin */
-.st-key-admin_nav{background:linear-gradient(180deg,rgba(18,30,62,.92),rgba(10,16,36,.92));border:1px solid var(--line);border-radius:20px;padding:10px 10px 14px;}
+.st-key-admin_nav{background:linear-gradient(180deg,rgba(18,30,62,.92),rgba(10,16,36,.92));border:1px solid var(--line);border-radius:20px;padding:10px 6px 14px 10px;
+  max-height:calc(100vh - 130px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:rgba(125,211,252,.45) transparent;}
+.st-key-admin_nav::-webkit-scrollbar{width:6px;}
+.st-key-admin_nav::-webkit-scrollbar-thumb{background:rgba(125,211,252,.4);border-radius:99px;}
+.st-key-admin_nav::-webkit-scrollbar-thumb:hover{background:rgba(125,211,252,.7);}
+.st-key-admin_nav [data-testid='stVerticalBlock']{gap:.35rem;padding-right:4px;}
 [data-testid='stColumn']:has(.st-key-admin_nav){position:sticky;top:96px;align-self:flex-start;}
 .adm-grp{font-size:.68rem;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:#6f86b8;padding:14px 10px 4px;}
 [class*='st-key-admnav_'] button{justify-content:flex-start!important;text-align:left!important;background:transparent!important;border:1px solid transparent!important;border-radius:12px!important;

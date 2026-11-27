@@ -5985,10 +5985,19 @@ _FX_JS = (
     "t.style.setProperty('--mx',(e.clientX-r.left)+'px');t.style.setProperty('--my',(e.clientY-r.top)+'px');});"
     "},{passive:true});}"
 )
+# Bấm một nút trong menu popover (👤 Tôi / Tài khoản...) thì tự đóng popover, khỏi che nội dung trang mới.
+_POPOVER_JS = (
+    "if(!P.__lpPop){P.__lpPop=true;"
+    "const closeOpen=function(){const t=P.document.querySelector(\"[data-testid='stPopover'] button[aria-expanded='true'],button[data-testid='stPopoverButton'][aria-expanded='true']\");if(t){t.click();}};"
+    "P.document.addEventListener('click',function(e){"
+    "const b=e.target&&e.target.closest?e.target.closest(\"[data-testid='stPopoverBody'] button\"):null;if(!b)return;"
+    "setTimeout(closeOpen,150);setTimeout(closeOpen,600);"
+    "},true);}"
+)
 _cookie_js = sync_auth_cookie()
 _hist_js = sync_page_url()
 # Nút ẩn: JS bấm vào đây khi người dùng Back/Forward để app đọc lại URL; khối ẩn chứa JS của app.
 with st.container(key="lpbridge"):
     st.button("nav", key="lp_nav_bridge")
 with st.container(key="lpjs"):
-    _run_js(_cookie_js + _hist_js + _FX_JS + oauth_popup_js())
+    _run_js(_cookie_js + _hist_js + _FX_JS + _POPOVER_JS + oauth_popup_js())

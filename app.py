@@ -1585,6 +1585,14 @@ def sync_local_images_to_storage() -> None:
             continue
 
 
+def cod_deposit() -> int:
+    """Tiền cọc bắt buộc khi chọn thanh toán COD (chống tài khoản 0đ đặt hàng spam). Chỉnh bằng setting 'cod_deposit' trong settings.json."""
+    try:
+        return max(0, int(float(setting("cod_deposit", "500000"))))
+    except ValueError:
+        return 500_000
+
+
 def min_topup() -> int:
     try:
         return max(1000, int(float(setting("min_topup", "50000"))))
@@ -4089,6 +4097,7 @@ def page_cart() -> None:
             <div class="lp-tick">✓</div>
             <h2 style="margin:0">Đặt hàng thành công!</h2>
             <p style="color:#bbf7d0;margin:10px 0 0">Cảm ơn <b>{esc(o['name'])}</b>. Đơn {o['items']} sản phẩm · tổng thanh toán <b>{vnd(o['total'])}</b> ({esc(o.get('pay_method', 'COD'))}).<br>
+            {('Đã đặt cọc <b>' + vnd(o['deposit']) + '</b> từ ví · còn lại <b>' + vnd(max(0, o['total'] - o['deposit'])) + '</b> thanh toán khi nhận hàng.<br>') if o.get('deposit') else ''}
             Giao tới: {esc(o['address'])} · SĐT {esc(o['phone'])}</p></div>
             """),
             unsafe_allow_html=True,
@@ -4157,7 +4166,8 @@ def page_cart() -> None:
 
             st.markdown("#### 📦 Thông tin nhận hàng")
             user_bal = get_user_balance(ss.user["username"]) if ss.user else 0
-            pay_opts = ["Thanh toán khi nhận hàng (COD)"]
+            deposit = min(cod_deposit(), total)  # cọc được tính thẳng vào tiền máy, không vượt quá tổng đơn
+            pay_opts = [f"Thanh toán khi nhận hàng (COD) — đặt cọc {vnd(deposit)}" if deposit else "Thanh toán khi nhận hàng (COD)"]
             if ss.user:
                 pay_opts.append(f"Số dư tài khoản ({vnd(user_bal)})")
 
@@ -4168,6 +4178,19 @@ def page_cart() -> None:
                 lg2.button("📝 Đăng ký", key="cart_register", on_click=login_to_order, args=("register",), use_container_width=True)
                 return
 
+            if deposit:
+                st.markdown(
+                    H(f"""
+                    <div class="lp-line"><span>Nếu chọn COD · đặt cọc (trừ từ ví)</span><span>−{vnd(deposit)}</span></div>
+                    <div class="lp-line total"><span>Còn phải trả khi nhận hàng</span><span>{vnd(total - deposit)}</span></div>
+                    """),
+                    unsafe_allow_html=True,
+                )
+                if user_bal >= deposit:
+                    st.info(f"💰 Đơn COD cần đặt cọc **{vnd(deposit)}**, được trừ từ ví ngay khi đặt hàng và tính vào tiền máy. Ví hiện có {vnd(user_bal)}.")
+                else:
+                    st.warning(f"💰 Đơn COD cần đặt cọc **{vnd(deposit)}** nhưng ví của bạn chỉ có {vnd(user_bal)}. Hãy nạp thêm tiền (hoặc thanh toán bằng số dư nếu đủ) để đặt hàng.")
+                    st.button("💳 Nạp tiền vào ví", key="cart_topup", on_click=go, args=("auth",))
             with st.form("checkout"):
                 pay_method = st.radio("Phương thức thanh toán", pay_opts)
                 name = st.text_input("Họ và tên", value=ss.user["fullname"] if ss.user else "")
@@ -4180,16 +4203,23 @@ def page_cart() -> None:
                     st.stop()
                 phone_s = phone.strip().replace(" ", "")
                 use_wallet = "Số dư tài khoản" in pay_method
+                need_deposit = 0 if use_wallet else deposit
+                user_bal = get_user_balance(ss.user["username"])  # đọc lại số dư mới nhất ngay lúc đặt
                 if not name.strip() or not phone_s or not addr.strip():
                     st.error("Vui lòng điền đầy đủ họ tên, số điện thoại và địa chỉ.")
                 elif not re.fullmatch(r"(0|\+84)\d{9,10}", phone_s):
                     st.error("Số điện thoại không hợp lệ (VD: 0901234567).")
                 elif use_wallet and user_bal < total:
                     st.error(f"Số dư ví không đủ ({vnd(user_bal)}). Vui lòng nạp thêm tiền tại trang Tài khoản.")
+                elif need_deposit and user_bal < need_deposit:
+                    st.error(f"Đặt hàng COD cần đặt cọc {vnd(need_deposit)} nhưng ví của bạn chỉ có {vnd(user_bal)}. Vui lòng nạp thêm tiền rồi đặt lại.")
                 else:
                     if ss.user:
                         if use_wallet:
                             update_user_balance(ss.user["username"], -total)
+                        elif need_deposit:
+                            update_user_balance(ss.user["username"], -need_deposit)
+                            add_log("(hệ thống)", "Đặt cọc COD", "", ss.user["username"], need_deposit, f"Cọc đơn COD {len(lines)} sản phẩm, tổng {total}, còn phải thu {total - need_deposit}")
                         today = str(date.today())
                         new = pd.DataFrame([(ss.user["username"], str(int(r["id"])), today) for r, _ in lines], columns=ORD_COLS)
                         write_csv(pd.concat([orders, new], ignore_index=True).drop_duplicates(subset=["username", "laptop_id", "date"]), F_ORD)
@@ -4200,6 +4230,7 @@ def page_cart() -> None:
                         "total": total,
                         "items": sum(q for _, q in lines),
                         "pay_method": "Ví tài khoản" if use_wallet else "COD",
+                        "deposit": need_deposit,
                     }
                     ss.cart = {}
                     ss.voucher = None

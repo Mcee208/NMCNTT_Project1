@@ -387,6 +387,54 @@ def vnd(p: int) -> str:
     return f"{int(p):,}".replace(",", ".") + " ₫"
 
 
+def _vi_num(x: float, nd: int = 2) -> str:
+    return f"{x:.{nd}f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
+def vnd_short(p) -> str:
+    """Đơn vị tiền tự co giãn theo độ dài: nhỏ → ₫, từ 10 triệu → triệu, từ 1 tỷ → tỷ (để luôn hiện đủ trong ô)."""
+    n = int(p)
+    a = abs(n)
+    if a >= 1_000_000_000:
+        return _vi_num(n / 1e9) + " tỷ"
+    if a >= 10_000_000:
+        return _vi_num(n / 1e6) + " triệu"
+    return vnd(n)
+
+
+KPI_TONES = {"cyan": "76,201,240", "green": "74,222,128", "amber": "251,191,36", "red": "248,113,113", "violet": "167,139,250", "pink": "244,114,182"}
+
+
+def stat_cards(items: list[dict]) -> None:
+    """Hàng thẻ số liệu nổi bật. Mỗi item: label, value, icon, tone, sub, money (tự rút gọn đơn vị), hero (nhấn mạnh)."""
+    cards = []
+    for it in items:
+        val, sub = it["value"], str(it.get("sub") or "")
+        if it.get("money"):
+            n = int(val)
+            txt, full = vnd_short(n), vnd(n)
+            sub = sub or (f"= {full}" if txt != full else "")
+            title = full
+        else:
+            txt = f"{val:,}".replace(",", ".") if isinstance(val, int) else str(val)
+            title = txt
+        k = KPI_TONES.get(it.get("tone", "cyan"), KPI_TONES["cyan"])
+        cls = "lp-kpi hero" if it.get("hero") else "lp-kpi"
+        long = " long" if len(txt) > 10 else ""
+        cards.append(
+            f'<div class="{cls}" style="--k:{k}" title="{esc(title)}"><div class="ic">{it.get("icon", "")}</div>'
+            f'<div class="bd"><span class="lb">{esc(it["label"])}</span><b class="vl{long}">{esc(txt)}</b>'
+            + (f'<span class="sb">{esc(sub)}</span>' if sub else "")
+            + "</div></div>"
+        )
+    st.markdown(H(f'<div class="lp-kpis">{"".join(cards)}</div>'), unsafe_allow_html=True)
+
+
+def section_head(icon: str, title: str, desc: str, tone: str = "cyan") -> None:
+    k = KPI_TONES.get(tone, KPI_TONES["cyan"])
+    st.markdown(H(f'<div class="lp-sec" style="--k:{k}"><div class="ic">{icon}</div><div><span class="t">{esc(title)}</span><span class="d">{esc(desc)}</span></div></div>'), unsafe_allow_html=True)
+
+
 def stars(n: float) -> str:
     n = int(round(n))
     return "★" * n + "☆" * (5 - n)
@@ -448,12 +496,52 @@ def laptop_svg(brand: str, sku: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
+def _cutout_uri(path: str, mtime: float) -> str:
+    """Ảnh sản phẩm nền trắng → nền trong suốt để hòa vào giao diện tối (chỉ bỏ vùng trắng nối liền với mép ảnh,
+    các chi tiết màu trắng bên trong sản phẩm được giữ nguyên). Ảnh đã trong suốt / không có nền trắng thì giữ nguyên."""
+    try:
+        import numpy as np
+        from PIL import Image, ImageFilter
+        im = Image.open(path).convert("RGBA")
+        im.thumbnail((720, 720))
+        a = np.asarray(im).astype(np.int16)
+        if (a[..., 3] < 250).mean() < 0.02:
+            rgb = a[..., :3]
+            cand = (rgb.min(axis=2) >= 230) & ((rgb.max(axis=2) - rgb.min(axis=2)) <= 26)
+            bg = (
+                np.logical_and.accumulate(cand, axis=1)
+                | np.logical_and.accumulate(cand[:, ::-1], axis=1)[:, ::-1]
+                | np.logical_and.accumulate(cand, axis=0)
+                | np.logical_and.accumulate(cand[::-1], axis=0)[::-1]
+            )
+            if bg.mean() < 0.06:  # ảnh không có nền trắng đáng kể
+                return file_uri(Path(path))
+            alpha = Image.fromarray(np.where(bg, 0, 255).astype("uint8"), "L")
+            alpha = alpha.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.9))
+            im.putalpha(alpha)
+        buf = io.BytesIO()
+        im.save(buf, "WEBP", quality=88, method=4)
+        return "data:image/webp;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return file_uri(Path(path))
+
+
+def cutout_img_html(path, style: str = "width:100%") -> str:
+    p = Path(path)
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return f'<img src="{_cutout_uri(str(p), mtime)}" style="{style}">'
+
+
+@st.cache_data(show_spinner=False)
 def _img_cached(name: str, brand: str, sku: str, mtime: float) -> str:
     p = IMG_DIR / name if name else None
     if p is not None:
         ensure_storage_file("images", name, p)
         if p.is_file():
-            return file_uri(p)
+            return _cutout_uri(str(p), mtime)
     return laptop_svg(brand, sku)
 
 
@@ -3239,6 +3327,45 @@ CSS_FIX = """
 [data-stale='true']{opacity:.6;transition:opacity .25s ease;}
 [data-testid='stStatusWidget']{border-radius:999px!important;backdrop-filter:blur(8px);}
 
+/* ===== THẺ SỐ LIỆU & TIÊU ĐỀ MỤC ADMIN ===== */
+.lp-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:4px 0 20px;}
+.lp-kpi{position:relative;display:flex;gap:14px;align-items:center;padding:16px 18px 16px 22px;border-radius:18px;overflow:hidden;min-width:0;
+  background:linear-gradient(135deg,rgba(var(--k),.15),rgba(12,20,42,.88) 64%);border:1px solid rgba(var(--k),.34);box-shadow:0 10px 26px rgba(0,0,0,.28);
+  transition:transform .25s ease,box-shadow .25s ease,border-color .25s ease;}
+.lp-kpi::before{content:"";position:absolute;left:0;top:16%;bottom:16%;width:4px;border-radius:0 4px 4px 0;background:rgb(var(--k));}
+.lp-kpi:hover{transform:translateY(-3px);border-color:rgba(var(--k),.7);box-shadow:0 16px 34px rgba(var(--k),.22);}
+.lp-kpi .ic{flex:none;width:46px;height:46px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:1.45rem;background:rgba(var(--k),.17);border:1px solid rgba(var(--k),.4);}
+.lp-kpi .bd{min-width:0;display:flex;flex-direction:column;gap:3px;flex:1;}
+.lp-kpi .lb{font-size:.72rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#a6b8dc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.lp-kpi .vl{font-family:var(--f-disp);font-size:clamp(1.55rem,2.2vw,2.1rem);line-height:1.1;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.lp-kpi .vl.long{font-size:clamp(1.3rem,1.8vw,1.7rem);}
+.lp-kpi .sb{font-size:.78rem;color:#8fa3cc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.lp-kpi.hero{background:linear-gradient(135deg,rgba(var(--k),.34),rgba(12,20,42,.9) 72%);border-color:rgba(var(--k),.7);box-shadow:0 0 0 1px rgba(var(--k),.22),0 14px 34px rgba(var(--k),.2);}
+.lp-kpi.hero .vl{color:rgb(var(--k));text-shadow:0 0 22px rgba(var(--k),.45);}
+.lp-sec{display:flex;gap:16px;align-items:center;padding:18px 22px;border-radius:20px;margin:0 0 16px;background:linear-gradient(120deg,rgba(var(--k),.24),rgba(12,20,42,.9) 68%);border:1px solid rgba(var(--k),.42);}
+.lp-sec .ic{flex:none;width:54px;height:54px;border-radius:16px;font-size:1.7rem;display:flex;align-items:center;justify-content:center;background:rgba(var(--k),.2);border:1px solid rgba(var(--k),.5);}
+.lp-sec .t{display:block;font-family:var(--f-disp);font-size:1.45rem;font-weight:800;color:#fff;line-height:1.2;}
+.lp-sec .d{display:block;margin-top:3px;font-size:.9rem;color:#a6b8dc;}
+
+/* Menu dọc chia nhóm của Admin */
+.st-key-admin_nav{background:linear-gradient(180deg,rgba(18,30,62,.92),rgba(10,16,36,.92));border:1px solid var(--line);border-radius:20px;padding:10px 10px 14px;}
+[data-testid='stColumn']:has(.st-key-admin_nav){position:sticky;top:96px;align-self:flex-start;}
+.adm-grp{font-size:.68rem;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:#6f86b8;padding:14px 10px 4px;}
+[class*='st-key-admnav_'] button{justify-content:flex-start!important;text-align:left!important;background:transparent!important;border:1px solid transparent!important;border-radius:12px!important;
+  color:#c9d6f2!important;min-height:42px;padding:6px 12px!important;box-shadow:none!important;}
+[class*='st-key-admnav_'] button p{text-align:left!important;width:100%;font-weight:600;}
+[class*='st-key-admnav_'] button:not(:disabled):hover{background:rgba(125,211,252,.1)!important;transform:translateX(3px)!important;filter:none!important;}
+[class*='st-key-admnav_'][class*='_on'] button{background:linear-gradient(90deg,rgba(76,201,240,.26),rgba(167,139,250,.14))!important;border-color:rgba(76,201,240,.55)!important;color:#fff!important;box-shadow:inset 3px 0 0 #4cc9f0!important;}
+[class*='st-key-admnav_'][class*='_on'] button p{font-weight:800;}
+
+/* Ảnh sản phẩm đã tách nền: nằm trên nền tối, có bóng đổ nhẹ */
+.lp-imgwrap{background:radial-gradient(ellipse at 50% 72%,rgba(76,201,240,.18),transparent 62%),#0a1226;}
+.lp-imgwrap img{object-fit:contain!important;padding:8px;filter:drop-shadow(0 14px 16px rgba(0,0,0,.5));}
+.lp-detail-img{background:radial-gradient(ellipse at 50% 70%,rgba(76,201,240,.2),transparent 62%),#0a1226;padding:14px;}
+.lp-detail-img img{filter:drop-shadow(0 22px 26px rgba(0,0,0,.55));}
+.lp-art-float img{border:none!important;border-radius:0!important;box-shadow:none!important;background:transparent!important;filter:drop-shadow(0 30px 40px rgba(0,0,0,.55)) drop-shadow(0 0 36px rgba(76,201,240,.28));}
+.lp-ci img{background:#0a1226;filter:drop-shadow(0 6px 8px rgba(0,0,0,.4));}
+
 /* Chuyển tab / mục mượt */
 [class*='st-key-admin_tab_pane_'],[class*='st-key-staff_tab_pane_']{animation:lp-tab-in .45s cubic-bezier(.22,1,.36,1) both;}
 @keyframes lp-tab-in{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
@@ -4159,11 +4286,12 @@ def render_statement(staff: str, day: str, key: str) -> None:
     ok, rej = d[d["status"] == ST_OK], d[d["status"] == ST_REJ]
     total_ok = int(pd.to_numeric(ok["amount"], errors="coerce").fillna(0).sum())
     flagged = int(((log["actor"] == staff) & (log["action"] == "Duyệt") & log["time"].str.startswith(day) & log["note"].str.startswith("CẢNH BÁO")).sum())
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Đơn đã duyệt", len(ok))
-    m2.metric("Tổng tiền đã cộng", vnd(total_ok))
-    m3.metric("Đơn từ chối", len(rej))
-    m4.metric("Duyệt dù có cảnh báo", flagged)
+    stat_cards([
+        {"label": "Đơn đã duyệt", "value": len(ok), "icon": "✅", "tone": "green"},
+        {"label": "Tổng tiền đã cộng", "value": total_ok, "money": True, "icon": "💰", "tone": "cyan", "hero": True},
+        {"label": "Đơn từ chối", "value": len(rej), "icon": "⛔", "tone": "red"},
+        {"label": "Duyệt dù có cảnh báo", "value": flagged, "icon": "⚠️", "tone": "amber"},
+    ])
     if d.empty:
         st.info(f"{staff} chưa xử lý đơn nào trong ngày {day}.")
         return
@@ -4247,6 +4375,50 @@ def persistent_tabs(labels: list[str], key: str) -> list:
     return panes
 
 
+ADMIN_NAV = [
+    ("Hàng hóa", [(0, "💻", "Sản phẩm & SKU"), (7, "📥", "Duyệt sản phẩm"), (8, "🤖", "So sánh giá (AI)")]),
+    ("Bán hàng", [(3, "📦", "Lịch sử đơn hàng"), (1, "🎟️", "Mã giảm giá"), (4, "💰", "Lịch sử nạp tiền")]),
+    ("Con người", [(2, "👥", "Người dùng"), (5, "🧑‍💼", "Quản lý Staff")]),
+    ("Hệ thống", [(6, "⚙️", "Cài đặt thanh toán"), (9, "🔐", "Tài khoản & Giao diện")]),
+]
+ADMIN_SECTIONS = {
+    0: ("💻", "Quản lý Sản phẩm & SKU", "Thêm, chỉnh sửa, xóa sản phẩm. Mã SKU và giá được sinh tự động theo màu.", "cyan"),
+    1: ("🎟️", "Quản lý Mã giảm giá", "Tạo và cập nhật voucher, phạm vi áp dụng, mức giảm và đơn tối thiểu.", "pink"),
+    2: ("👥", "Quản lý Người dùng", "Danh sách tài khoản, số dư ví, phân quyền và xóa tài khoản.", "violet"),
+    3: ("📦", "Lịch sử Đơn hàng", "Toàn bộ giao dịch mua hàng đã được xác nhận.", "green"),
+    4: ("💰", "Lịch sử Nạp tiền", "Các giao dịch nạp tiền vào ví và trạng thái duyệt.", "amber"),
+    5: ("🧑‍💼", "Quản lý Staff", "Theo dõi nhân viên, hạn mức và các đơn nạp tiền đang được xử lý.", "violet"),
+    6: ("⚙️", "Cài đặt thanh toán", "Tài khoản ngân hàng, mã QR và quy tắc duyệt giao dịch.", "cyan"),
+    7: ("📥", "Duyệt sản phẩm", "Xem xét yêu cầu thêm / chỉnh sửa sản phẩm do staff gửi lên.", "amber"),
+    8: ("🤖", "So sánh giá (AI)", "Dữ liệu giá đối thủ để AI tư vấn trả lời chính xác.", "cyan"),
+    9: ("🔐", "Tài khoản & Giao diện", "Thông tin Admin, tên cửa hàng, logo và giao diện website.", "pink"),
+}
+
+
+def _set_admin_tab(i: int) -> None:
+    ss["admin_tab"] = i
+
+
+def admin_shell(badges: dict) -> list:
+    """Menu dọc chia nhóm bên trái + vùng nội dung bên phải. Trả về 10 container (chỉ container của mục đang mở được vẽ nội dung)."""
+    if not isinstance(ss.get("admin_tab"), int) or not 0 <= ss["admin_tab"] < len(ADMIN_SECTIONS):
+        ss["admin_tab"] = 0
+    sel = ss["admin_tab"]
+    nav, main = st.columns([1, 4.3], gap="large")
+    with nav:
+        with st.container(key="admin_nav"):
+            for grp, items in ADMIN_NAV:
+                st.markdown(f'<div class="adm-grp">{esc(grp)}</div>', unsafe_allow_html=True)
+                for i, ic, lb in items:
+                    n = int(badges.get(i, 0) or 0)
+                    with st.container(key=f"admnav_{i}_{'on' if i == sel else 'off'}"):
+                        st.button(f"{ic}  {lb}" + (f"   ●  {n}" if n else ""), key=f"admnav_btn_{i}", on_click=_set_admin_tab, args=(i,), use_container_width=True)
+    with main:
+        ic, title, desc, tone = ADMIN_SECTIONS[sel]
+        section_head(ic, title, desc, tone)
+        return [st.container(key=f"admin_tab_pane_{i}") for i in range(len(ADMIN_SECTIONS))]
+
+
 def page_staff() -> None:
     role = ss.user["role"] if ss.user else ""
     if role not in ("staff", "admin"):
@@ -4271,11 +4443,12 @@ def page_staff() -> None:
         if _me.empty or not _me.iloc[0]["phone"]:
             st.warning("📵 Bạn chưa cập nhật số điện thoại nên khách hàng chưa liên hệ được với bạn ở trang Hỗ trợ.")
         st.button("👤 Thông tin cá nhân", key="staff_to_profile", on_click=go, args=("staff_profile",))
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Đơn đang chờ nhận", n_wait)
-    m2.metric("Tôi đang xử lý", len(mine))
-    m3.metric("Tôi đã duyệt hôm nay", len(ok_today))
-    m4.metric("Tiền tôi đã duyệt hôm nay", vnd(int(pd.to_numeric(ok_today["amount"], errors="coerce").fillna(0).sum())))
+    stat_cards([
+        {"label": "Đơn đang chờ nhận", "value": n_wait, "icon": "⏳", "tone": "amber", "hero": True},
+        {"label": "Tôi đang xử lý", "value": len(mine), "icon": "🛠️", "tone": "violet"},
+        {"label": "Tôi đã duyệt hôm nay", "value": len(ok_today), "icon": "✅", "tone": "green"},
+        {"label": "Tiền tôi đã duyệt hôm nay", "value": int(pd.to_numeric(ok_today["amount"], errors="coerce").fillna(0).sum()), "money": True, "icon": "💰", "tone": "cyan", "hero": True},
+    ])
     st.caption(
         f"Quy trình: **nhận đơn** ở Hàng chờ → mở app ngân hàng đối chiếu **số tiền**, **nội dung chuyển khoản**, **thời gian** → tick xác nhận → cộng tiền. "
         f"Mỗi người giữ tối đa {MAX_CLAIMS} đơn, đơn giữ quá {CLAIM_TTL_MIN} phút không xử lý sẽ quay lại hàng chờ. "
@@ -4392,11 +4565,12 @@ def admin_staff_tab() -> None:
     today = date.today().strftime("%Y-%m-%d")
     ok_today = top[(top["status"] == ST_OK) & top["reviewed_at"].str.startswith(today)]
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Nhân viên", len(staff), f"{int((staff['status'] == 'locked').sum())} đang khóa" if len(staff) else None, delta_color="off")
-    k2.metric("Chờ duyệt", int((top["status"] == ST_PENDING).sum()))
-    k3.metric("Đã duyệt hôm nay", len(ok_today))
-    k4.metric("Tiền đã duyệt hôm nay", vnd(int(pd.to_numeric(ok_today["amount"], errors="coerce").fillna(0).sum())))
+    stat_cards([
+        {"label": "Nhân viên", "value": len(staff), "icon": "🧑‍💼", "tone": "violet", "sub": f"{int((staff['status'] == 'locked').sum())} đang khóa"},
+        {"label": "Chờ duyệt", "value": int((top["status"] == ST_PENDING).sum()), "icon": "⏳", "tone": "amber", "hero": True, "sub": "đơn nạp tiền"},
+        {"label": "Đã duyệt hôm nay", "value": len(ok_today), "icon": "✅", "tone": "green"},
+        {"label": "Tiền đã duyệt hôm nay", "value": int(pd.to_numeric(ok_today["amount"], errors="coerce").fillna(0).sum()), "money": True, "icon": "💰", "tone": "cyan", "hero": True},
+    ])
     st.button("🧾 Mở cổng Staff (duyệt nạp tiền)", key="open_staff_portal", on_click=go, args=("staff",))
 
     st.subheader("📌 Đơn đang được nhân viên nhận xử lý")
@@ -4797,7 +4971,7 @@ def _prq_review_list() -> None:
                 if ip is not None:
                     ensure_storage_file("images", f"pending/{ip.name}", ip)
                 if ip is not None and ip.is_file():
-                    st.image(str(ip))
+                    st.markdown(cutout_img_html(ip, "width:100%;border-radius:16px;filter:drop-shadow(0 10px 16px rgba(0,0,0,.45))"), unsafe_allow_html=True)
                     if is_edit:
                         st.caption("Ảnh mới đề xuất")
                 elif is_edit and not lap[lap["id"].astype(str) == str(r["target_id"])].empty:
@@ -4832,6 +5006,12 @@ def _prq_review_list() -> None:
 
 def admin_products_tab() -> None:
     prq = read_csv(F_PRQ, PRQ_COLS)
+    _today = date.today().strftime("%Y-%m-%d")
+    stat_cards([
+        {"label": "Chờ duyệt", "value": int((prq["status"] == ST_PRQ_PENDING).sum()), "icon": "📥", "tone": "amber", "hero": True, "sub": "yêu cầu từ staff"},
+        {"label": "Đã xử lý hôm nay", "value": int(((prq["status"] != ST_PRQ_PENDING) & prq["reviewed_at"].astype(str).str.startswith(_today)).sum()), "icon": "✅", "tone": "green"},
+        {"label": "Tổng yêu cầu", "value": len(prq), "icon": "🗂️", "tone": "violet"},
+    ])
     _prq_review_list()
     done = prq[prq["status"] != ST_PRQ_PENDING].iloc[::-1]
     if not done.empty:
@@ -4852,10 +5032,11 @@ def admin_compare_tab() -> None:
     lap = load_laptops()
     cmp_df = load_competitors()
     covered = cmp_df["sku"].str.upper().nunique()
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Mẫu đã có dữ liệu giá", f"{covered}/{len(lap)}")
-    m2.metric("Số dòng giá đối thủ", len(cmp_df))
-    m3.metric("Website đối thủ", cmp_df["store"].str.casefold().nunique() if not cmp_df.empty else 0)
+    stat_cards([
+        {"label": "Mẫu đã có dữ liệu giá", "value": f"{covered}/{len(lap)}", "icon": "🎯", "tone": "cyan", "hero": True, "sub": "so với kho hiện tại"},
+        {"label": "Số dòng giá đối thủ", "value": len(cmp_df), "icon": "🧾", "tone": "violet"},
+        {"label": "Website đối thủ", "value": int(cmp_df["store"].str.casefold().nunique()) if not cmp_df.empty else 0, "icon": "🌐", "tone": "green"},
+    ])
 
     if lap.empty:
         st.warning("Kho chưa có sản phẩm.")
@@ -5155,62 +5336,52 @@ def page_admin() -> None:
         return
 
     st.title("🛡️ Bảng điều khiển Quản trị viên (Admin Portal)")
-    with st.expander("📘 Quy ước mã SKU & giá theo màu"):
-        st.markdown(
-            "**Định dạng:** `<HÃNG>-<DÒNG>-<MÀU>`  \n"
-            "**S** Bạc (+0%) · **B** Đen (+0%) · **R** Đỏ (+1%) · **W** Trắng (+2%) · **G** Vàng (+3%)  \n"
-            "Chọn **Không áp dụng mã màu** cho sản phẩm có giá như nhau ở mọi màu (SKU không có đuôi màu, giá giữ nguyên)."
-        )
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Tổng sản phẩm", len(laptops))
-    k2.metric("Máy Gaming", int(laptops.apply(is_gaming_laptop, axis=1).sum()) if not laptops.empty else 0)
-    k3.metric("Đơn hàng đã đặt", len(orders))
-    k4.metric("Thành viên", len(users))
-    k5.metric("Mã giảm giá", len(vouchers_dict))
-    st.write("")
-
     _n_prq = int((read_csv(F_PRQ, PRQ_COLS)["status"] == ST_PRQ_PENDING).sum())
-    tab_prod, tab_vch, tab_usr, tab_ord, tab_top, tab_staff, tab_set, tab_prq, tab_cmp, tab_prof = persistent_tabs([
-        "💻 Quản lý Sản phẩm & SKU",
-        "🎟️ Quản lý Mã giảm giá",
-        "👥 Quản lý Người dùng",
-        "📦 Lịch sử Đơn hàng",
-        "💰 Lịch sử Nạp tiền",
-        "🧑‍💼 Quản lý Staff",
-        "⚙️ Cài đặt thanh toán",
-        f"📥 Duyệt sản phẩm ({_n_prq})",
-        "🤖 So sánh giá (AI)",
-        "🔐 Tài khoản & Giao diện",
-    ], "admin_tab")
+    _n_top = int((read_csv(F_TOP, TOP_COLS)["status"] == ST_PENDING).sum())
+    tab_prod, tab_vch, tab_usr, tab_ord, tab_top, tab_staff, tab_set, tab_prq, tab_cmp, tab_prof = admin_shell({7: _n_prq, 4: _n_top})
 
     for _ in lazy_pane(tab_prod, "admin_tab", 0):
-        st.subheader("➕ Thêm sản phẩm mới (Tự động sinh mã SKU & cộng giá theo màu)")
-        with st.form("add_laptop", clear_on_submit=True):
-            a1, a2, a3 = st.columns([2, 1, 1])
-            name = a1.text_input("Tên máy", placeholder="MacBook Air 13 M5 / ASUS ROG Strix G16")
-            brand = a2.selectbox("Hãng", ["Apple", "Acer", "ASUS", "Dell", "Gigabyte", "HP", "Lenovo", "LG", "MSI"])
-            series_code = a3.text_input("Mã dòng (viết hoa)", placeholder="MBA13M5 hoặc ROG16-01")
-
-            b1, b2, b3, b4 = st.columns(4)
-            color_code = b1.selectbox(
-                "Mã màu",
-                ["", *COLOR_RULES.keys()],
-                index=1,
-                format_func=lambda c: "Không áp dụng mã màu" if not c else f"{c} — {COLOR_RULES[c][0]} (+{int(COLOR_RULES[c][1]*100)}%)",
+        _prices = pd.to_numeric(laptops["price"], errors="coerce").fillna(0) if not laptops.empty else pd.Series(dtype=float)
+        stat_cards([
+            {"label": "Tổng sản phẩm", "value": len(laptops), "icon": "💻", "tone": "cyan", "hero": True},
+            {"label": "Máy Gaming", "value": int(laptops.apply(is_gaming_laptop, axis=1).sum()) if not laptops.empty else 0, "icon": "🎮", "tone": "violet"},
+            {"label": "Thương hiệu", "value": int(laptops["brand"].nunique()) if not laptops.empty else 0, "icon": "🏷️", "tone": "green"},
+            {"label": "Giá trung bình", "value": int(_prices.mean()) if len(_prices) else 0, "money": True, "icon": "💵", "tone": "amber"},
+        ])
+        with st.expander("📘 Quy ước mã SKU & giá theo màu"):
+            st.markdown(
+                "**Định dạng:** `<HÃNG>-<DÒNG>-<MÀU>`  \n"
+                "**S** Bạc (+0%) · **B** Đen (+0%) · **R** Đỏ (+1%) · **W** Trắng (+2%) · **G** Vàng (+3%)  \n"
+                "Chọn **Không áp dụng mã màu** cho sản phẩm có giá như nhau ở mọi màu (SKU không có đuôi màu, giá giữ nguyên)."
             )
-            base_price = b2.number_input("Giá gốc (₫)", min_value=1000000, step=500000, value=25000000)
-            ram = b3.selectbox("RAM", ["8GB", "16GB", "24GB", "32GB", "36GB", "64GB", "128GB"], index=1)
-            ssd = b4.selectbox("Lưu trữ", ["256GB", "512GB", "1TB", "2TB", "4TB"], index=1)
+        _add_open = st.expander("➕ Thêm sản phẩm mới (tự động sinh mã SKU & cộng giá theo màu)", expanded=False)
+        with _add_open:
+          with st.form("add_laptop", clear_on_submit=True):
+              a1, a2, a3 = st.columns([2, 1, 1])
+              name = a1.text_input("Tên máy", placeholder="MacBook Air 13 M5 / ASUS ROG Strix G16")
+              brand = a2.selectbox("Hãng", ["Apple", "Acer", "ASUS", "Dell", "Gigabyte", "HP", "Lenovo", "LG", "MSI"])
+              series_code = a3.text_input("Mã dòng (viết hoa)", placeholder="MBA13M5 hoặc ROG16-01")
 
-            d1, d2, d3, d4 = st.columns(4)
-            cpu = d1.text_input("CPU", placeholder="Apple M5 / Intel Core i7-13650HX")
-            gpu = d2.text_input("GPU", placeholder="NVIDIA RTX 4060 / Apple GPU")
-            screen = d3.text_input("Màn hình", placeholder='15.6" FHD 144Hz')
-            os_name = d4.selectbox("Hệ điều hành", ["Windows", "macOS"])
+              b1, b2, b3, b4 = st.columns(4)
+              color_code = b1.selectbox(
+                  "Mã màu",
+                  ["", *COLOR_RULES.keys()],
+                  index=1,
+                  format_func=lambda c: "Không áp dụng mã màu" if not c else f"{c} — {COLOR_RULES[c][0]} (+{int(COLOR_RULES[c][1]*100)}%)",
+              )
+              base_price = b2.number_input("Giá gốc (₫)", min_value=1000000, step=500000, value=25000000)
+              ram = b3.selectbox("RAM", ["8GB", "16GB", "24GB", "32GB", "36GB", "64GB", "128GB"], index=1)
+              ssd = b4.selectbox("Lưu trữ", ["256GB", "512GB", "1TB", "2TB", "4TB"], index=1)
 
-            desc = st.text_area("Mô tả sản phẩm", height=80)
-            up = st.file_uploader("Ảnh sản phẩm (tùy chọn)", type=["png", "jpg", "jpeg", "webp"])
-            ok = st.form_submit_button("Lưu sản phẩm vào CSDL", type="primary")
+              d1, d2, d3, d4 = st.columns(4)
+              cpu = d1.text_input("CPU", placeholder="Apple M5 / Intel Core i7-13650HX")
+              gpu = d2.text_input("GPU", placeholder="NVIDIA RTX 4060 / Apple GPU")
+              screen = d3.text_input("Màn hình", placeholder='15.6" FHD 144Hz')
+              os_name = d4.selectbox("Hệ điều hành", ["Windows", "macOS"])
+
+              desc = st.text_area("Mô tả sản phẩm", height=80)
+              up = st.file_uploader("Ảnh sản phẩm (tùy chọn)", type=["png", "jpg", "jpeg", "webp"])
+              ok = st.form_submit_button("Lưu sản phẩm vào CSDL", type="primary")
 
         if ok:
             s_clean = re.sub(r"[^A-Z0-9-]", "", series_code.strip().upper())
@@ -5335,8 +5506,15 @@ def page_admin() -> None:
                             st.rerun()
 
     for _ in lazy_pane(tab_vch, "admin_tab", 1):
-        st.subheader("🎟️ Danh sách Voucher")
         df_v_show = read_csv(F_VCH, VCH_COLS)
+        _disc = pd.to_numeric(df_v_show["discount"], errors="coerce").fillna(0)
+        stat_cards([
+            {"label": "Tổng mã giảm giá", "value": len(df_v_show), "icon": "🎟️", "tone": "pink", "hero": True},
+            {"label": "Mức giảm cao nhất", "value": f"{_vi_num(float(_disc.max()) * 100, 1)}%" if len(_disc) else "0%", "icon": "🔥", "tone": "amber"},
+            {"label": "Áp dụng toàn bộ SP", "value": int((df_v_show["scope"] == "all").sum()), "icon": "🛍️", "tone": "green"},
+            {"label": "Chỉ máy Gaming", "value": int((df_v_show["scope"] == "gaming").sum()), "icon": "🎮", "tone": "violet"},
+        ])
+        st.subheader("🎟️ Danh sách Voucher")
         if df_v_show.empty:
             st.info("Chưa có mã giảm giá nào trong `vouchers.csv`.")
         else:
@@ -5361,6 +5539,13 @@ def page_admin() -> None:
                     st.rerun()
 
     for _ in lazy_pane(tab_usr, "admin_tab", 2):
+        _bal = pd.to_numeric(users["balance"], errors="coerce").fillna(0)
+        stat_cards([
+            {"label": "Tổng tài khoản", "value": len(users), "icon": "👥", "tone": "cyan", "hero": True},
+            {"label": "Khách hàng", "value": int((users["role"] == "user").sum()), "icon": "🛒", "tone": "green"},
+            {"label": "Staff / Admin", "value": int(users["role"].isin(["staff", "admin"]).sum()), "icon": "🛡️", "tone": "violet"},
+            {"label": "Tổng số dư ví", "value": int(_bal.sum()), "money": True, "icon": "👛", "tone": "amber", "hero": True},
+        ])
         st.subheader("👥 CSDL Tài khoản người dùng (`users.csv`)")
         adm_users = users[["username", "fullname", "role", "email"]].copy()
         adm_users["Số dư ví"] = [vnd(int(float(b or 0))) for b in users["balance"]]
@@ -5404,6 +5589,11 @@ def page_admin() -> None:
                     st.rerun()
 
     for _ in lazy_pane(tab_ord, "admin_tab", 3):
+        stat_cards([
+            {"label": "Tổng đơn hàng", "value": len(orders), "icon": "📦", "tone": "green", "hero": True},
+            {"label": "Khách đã mua", "value": int(orders["username"].nunique()) if not orders.empty else 0, "icon": "🧑", "tone": "cyan"},
+            {"label": "Mẫu đã bán", "value": int(orders["laptop_id"].nunique()) if not orders.empty else 0, "icon": "💻", "tone": "violet"},
+        ])
         st.subheader("📦 Lịch sử giao dịch đã xác nhận (`orders.csv`)")
         if orders.empty:
             st.info("Chưa có đơn hàng nào.")
@@ -5411,6 +5601,13 @@ def page_admin() -> None:
             st.dataframe(orders, use_container_width=True, hide_index=True)
 
     for _ in lazy_pane(tab_top, "admin_tab", 4):
+        _amt = pd.to_numeric(topups["amount"], errors="coerce").fillna(0)
+        stat_cards([
+            {"label": "Tổng giao dịch", "value": len(topups), "icon": "🧾", "tone": "cyan"},
+            {"label": "Chờ duyệt", "value": int((topups["status"] == ST_PENDING).sum()), "icon": "⏳", "tone": "amber", "hero": True},
+            {"label": "Đã duyệt", "value": int((topups["status"] == ST_OK).sum()), "icon": "✅", "tone": "green"},
+            {"label": "Tổng tiền đã nạp", "value": int(_amt[topups["status"] == ST_OK].sum()), "money": True, "icon": "💰", "tone": "cyan", "hero": True},
+        ])
         st.subheader("💰 Lịch sử nạp tiền vào ví (`topups.csv`)")
         if topups.empty:
             st.info("Chưa có giao dịch nạp tiền nào.")

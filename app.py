@@ -1181,6 +1181,12 @@ def social_buttons(scope: str, verb: str, link_user: str = "") -> None:
             else:
                 with st.container(key=f"soc_{scope}_{key}"):
                     st.button(f"{verb} {meta['label']}", key=f"socb_{scope}_{key}", on_click=set_demo_provider, args=(key,), use_container_width=True)
+    _ready = [k for k in PROVIDERS if provider_ready(k)]
+    if _ready:  # đường dự phòng: mở trang đăng nhập ở TAB MỚI (không phụ thuộc việc trình duyệt cho phép chuyển trang cha)
+        _alts = " · ".join(
+            f'<a href="{esc(build_auth_url(k, link_user))}" target="_blank" rel="noopener noreferrer">{esc(PROVIDERS[k]["label"])}</a>' for k in _ready
+        )
+        st.markdown(f'<div class="lp-soc-alt">Bấm nút mà không chuyển trang? Mở đăng nhập ở tab mới: {_alts}</div>', unsafe_allow_html=True)
     helped = ss.get("social_help")
     if helped and not provider_ready(helped):
         meta = PROVIDERS[helped]
@@ -3382,6 +3388,10 @@ CSS_FIX = """
 .lp-detail-img img{filter:drop-shadow(0 22px 26px rgba(0,0,0,.55));}
 .lp-art-float img{border:none!important;border-radius:0!important;box-shadow:none!important;background:transparent!important;filter:drop-shadow(0 30px 40px rgba(0,0,0,.55)) drop-shadow(0 0 36px rgba(76,201,240,.28));}
 .lp-ci img{background:#0a1226;filter:drop-shadow(0 6px 8px rgba(0,0,0,.4));}
+
+.lp-soc-alt{margin:6px 0 2px;font-size:.78rem;color:#8fa3cc;text-align:center;}
+.lp-soc-alt a{color:#7dd3fc!important;font-weight:700;text-decoration:none;}
+.lp-soc-alt a:hover{text-decoration:underline;}
 
 /* Chuyển tab / mục mượt */
 [class*='st-key-admin_tab_pane_'],[class*='st-key-staff_tab_pane_']{animation:lp-tab-in .45s cubic-bezier(.22,1,.36,1) both;}

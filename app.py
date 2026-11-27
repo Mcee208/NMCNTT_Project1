@@ -495,15 +495,43 @@ def laptop_svg(brand: str, sku: str) -> str:
     return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode()
 
 
-@st.cache_data(show_spinner=False)
-def _cutout_uri(path: str, mtime: float) -> str:
+def is_mobile_client() -> bool:
+    """Nhận diện điện thoại qua User-Agent của request (iPad hiện đại báo là máy Mac nên được coi là máy tính)."""
+    try:
+        ua = str(st.context.headers.get("User-Agent", "") or "")
+    except Exception:
+        return False
+    return bool(re.search(r"iPhone|iPod|Android.+Mobile|Mobile.+Safari|Windows Phone|webOS|BlackBerry|Opera Mini|IEMobile", ua, re.I))
+
+
+IS_MOBILE = is_mobile_client()
+IMG_PX_FULL, IMG_PX_CARD = 720, 480  # cạnh dài tối đa của ảnh nhúng: trang chi tiết / thẻ sản phẩm
+
+
+@st.cache_data(show_spinner=False, max_entries=400)
+def _thumb_uri(path: str, mtime: float, px: int = 64) -> str:
+    """Ảnh nhỏ (logo...) nhúng vào HTML. Luôn thu nhỏ để tránh nhúng file gốc nặng nhiều MB."""
+    try:
+        im = Image.open(path)
+        im.load()
+        im = im.convert("RGBA")
+        im.thumbnail((px, px))
+        buf = io.BytesIO()
+        im.save(buf, "WEBP", quality=85, method=4)
+        return "data:image/webp;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return file_uri(Path(path))
+
+
+@st.cache_data(show_spinner=False, max_entries=400)
+def _cutout_uri(path: str, mtime: float, px: int = IMG_PX_FULL) -> str:
     """Ảnh sản phẩm nền trắng → nền trong suốt để hòa vào giao diện tối (chỉ bỏ vùng trắng nối liền với mép ảnh,
     các chi tiết màu trắng bên trong sản phẩm được giữ nguyên). Ảnh đã trong suốt / không có nền trắng thì giữ nguyên."""
     try:
         import numpy as np
         from PIL import Image, ImageFilter
         im = Image.open(path).convert("RGBA")
-        im.thumbnail((720, 720))
+        im.thumbnail((px, px))
         a = np.asarray(im).astype(np.int16)
         if (a[..., 3] < 250).mean() < 0.02:
             rgb = a[..., :3]
@@ -514,16 +542,17 @@ def _cutout_uri(path: str, mtime: float) -> str:
                 | np.logical_and.accumulate(cand, axis=0)
                 | np.logical_and.accumulate(cand[::-1], axis=0)[::-1]
             )
-            if bg.mean() < 0.06:  # ảnh không có nền trắng đáng kể
-                return file_uri(Path(path))
-            alpha = Image.fromarray(np.where(bg, 0, 255).astype("uint8"), "L")
-            alpha = alpha.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.9))
-            im.putalpha(alpha)
+            # Ảnh không có nền trắng đáng kể thì giữ nguyên nền, nhưng VẪN dùng bản đã thu nhỏ
+            # (trước đây trả về file gốc → nhúng nguyên ảnh nhiều MB vào trang, làm Safari iPhone crash).
+            if bg.mean() >= 0.06:
+                alpha = Image.fromarray(np.where(bg, 0, 255).astype("uint8"), "L")
+                alpha = alpha.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.9))
+                im.putalpha(alpha)
         buf = io.BytesIO()
-        im.save(buf, "WEBP", quality=88, method=4)
+        im.save(buf, "WEBP", quality=88 if px >= IMG_PX_FULL else 80, method=4)
         return "data:image/webp;base64," + base64.b64encode(buf.getvalue()).decode()
     except Exception:
-        return file_uri(Path(path))
+        return _thumb_uri(str(path), mtime, px)
 
 
 def cutout_img_html(path, style: str = "width:100%") -> str:
@@ -535,21 +564,22 @@ def cutout_img_html(path, style: str = "width:100%") -> str:
     return f'<img src="{_cutout_uri(str(p), mtime)}" style="{style}">'
 
 
-@st.cache_data(show_spinner=False)
-def _img_cached(name: str, brand: str, sku: str, mtime: float) -> str:
+@st.cache_data(show_spinner=False, max_entries=400)
+def _img_cached(name: str, brand: str, sku: str, mtime: float, px: int = IMG_PX_FULL) -> str:
     p = IMG_DIR / name if name else None
     if p is not None:
         ensure_storage_file("images", name, p)
         if p.is_file():
-            return _cutout_uri(str(p), mtime)
+            return _cutout_uri(str(p), mtime, px)
     return laptop_svg(brand, sku)
 
 
-def img_uri(row) -> str:
+def img_uri(row, px: int = IMG_PX_FULL) -> str:
+    """px: cạnh dài tối đa. Danh sách / giỏ hàng dùng IMG_PX_CARD cho nhẹ, trang chi tiết dùng bản lớn."""
     name = str(row["image"] or "")
     p = IMG_DIR / name if name else None
     mtime = p.stat().st_mtime if (p is not None and p.is_file()) else 0.0
-    return _img_cached(name, str(row["brand"]), str(row.get("sku", "")), mtime)
+    return _img_cached(name, str(row["brand"]), str(row.get("sku", "")), mtime, px)
 
 
 # =====================================================
@@ -3515,7 +3545,52 @@ CSS_FIX = """
 /* 5) Tôn trọng người dùng tắt hiệu ứng chuyển động */
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important;}}
 """
-st.markdown(f"<style>{CSS}{CSS_FIX}{_confetti_css()}</style>", unsafe_allow_html=True)
+CSS_MOBILE = """
+/* ===== GIAO DIỆN RIÊNG CHO ĐIỆN THOẠI (chỉ được nhúng khi User-Agent là mobile) ===== */
+/* Thanh trên cùng dính khi cuộn: logo + giỏ hàng + tài khoản */
+[data-testid='stElementContainer']:has(>.st-key-mtopbar),.element-container:has(>.st-key-mtopbar),
+[data-testid='stLayoutWrapper']:has(>.st-key-mtopbar){
+  position:sticky!important;top:0;z-index:1000;
+  width:100vw!important;max-width:100vw!important;
+  margin-left:calc(50% - 50vw)!important;margin-right:calc(50% - 50vw)!important;
+}
+.st-key-mtopbar{
+  box-sizing:border-box;width:100%!important;max-width:100%!important;margin:0!important;
+  padding:max(8px,env(safe-area-inset-top)) 12px 8px;border-radius:0 0 16px 16px;
+  background:#0a122a;border:1px solid rgba(160,190,255,.24);border-top:0;
+  box-shadow:0 6px 18px rgba(0,0,0,.55);
+}
+.st-key-mtopbar [data-testid='stVerticalBlock']{gap:0!important;}
+.st-key-mtopbar [data-testid='stHorizontalBlock'],.st-key-mtools [data-testid='stHorizontalBlock']{
+  flex-direction:row!important;flex-wrap:nowrap!important;gap:.4rem!important;align-items:center;width:100%!important;}
+.st-key-mtopbar [data-testid='stColumn'],.st-key-mtopbar [data-testid='column'],
+.st-key-mtools [data-testid='stColumn'],.st-key-mtools [data-testid='column']{width:auto!important;min-width:0!important;flex:1 1 0!important;}
+.st-key-mtopbar [data-testid='stColumn']:nth-child(1),.st-key-mtopbar [data-testid='column']:nth-child(1){flex:1 1 auto!important;min-width:0!important;}
+.st-key-mtopbar [data-testid='stColumn']:nth-child(2),.st-key-mtopbar [data-testid='column']:nth-child(2){flex:0 0 24%!important;}
+.st-key-mtopbar [data-testid='stColumn']:nth-child(3),.st-key-mtopbar [data-testid='column']:nth-child(3){flex:0 0 24%!important;}
+.st-key-mtopbar .lp-tagline{display:none!important;}
+.st-key-mtopbar .lp-logo{width:36px!important;height:36px!important;border-radius:11px!important;font-size:1.15rem!important;}
+.st-key-mtopbar .lp-brandlink{gap:8px!important;}
+.st-key-mtopbar .lp-store{font-size:.95rem!important;letter-spacing:.03em!important;}
+.st-key-mtopbar button,.st-key-mtools button{padding:.25rem .45rem!important;min-height:2.3rem!important;white-space:nowrap;}
+.st-key-mtopbar button p,.st-key-mtools button p{font-size:.82rem!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+/* Khối công cụ phía dưới: cuộn đi bình thường */
+.st-key-mtools{padding:8px 4px 2px;}
+.st-key-mtools [data-testid='stVerticalBlock']{gap:.5rem!important;}
+.st-key-mtools input{color:#fff!important;-webkit-text-fill-color:#fff!important;}
+.st-key-mtools input::placeholder{color:#a5c0eb!important;-webkit-text-fill-color:#a5c0eb!important;}
+/* Bỏ hiệu ứng nặng: Safari iPhone dễ hết bộ nhớ / giật */
+/* ẩn lớp sao nền; vẫn giữ thanh tải trang (cùng dùng ::after) */
+.stApp:not(:has([data-testid='stStatusWidget']))::after{display:none!important;}
+.stApp::before{filter:none!important;}
+[class*='st-key-card_']{animation:none!important;}
+[class*='st-key-card_']::before,[class*='st-key-card_']::after{display:none!important;}
+.lp-imgwrap img,.lp-detail-img img{filter:none!important;animation:none!important;transition:none!important;content-visibility:visible;}
+.lp-sechead,.lp-spec,.lp-desc,.lp-sum,.lp-review,.lp-detail-img,.lp-bank-box,.lp-wallet-card,.lp-acc,.lp-linkrow,.lp-empty,.lp-auth-side,
+[class*='st-key-cartrow_'],[class*='st-key-summary'],[data-testid='stForm'],[data-testid='stMetric']{animation:none!important;}
+*{backdrop-filter:none!important;-webkit-backdrop-filter:none!important;}
+"""
+st.markdown(f"<style>{CSS}{CSS_FIX}{_confetti_css()}{CSS_MOBILE if IS_MOBILE else ''}</style>", unsafe_allow_html=True)
 
 # =====================================================
 # 6. KHỞI TẠO & NẠP DỮ LIỆU
@@ -3567,7 +3642,10 @@ for _k in ("q", "category", "price", "sort", "brands"):
     ss[_k] = ss[_k]
 
 logo_path = custom_logo_path() or (IMG_DIR / "logo.png")
-logo_html = f'<img src="{file_uri(logo_path)}" style="width:100%;height:100%;object-fit:cover">' if logo_path.is_file() else "💻"
+logo_html = (
+    f'<img src="{_thumb_uri(str(logo_path), logo_path.stat().st_mtime, 96)}" style="width:100%;height:100%;object-fit:cover">'
+    if logo_path.is_file() else "💻"
+)
 
 n_items = sum(ss.cart.values())
 show_filters = ss.page not in ("admin", "staff")
@@ -3579,8 +3657,23 @@ n_active = (
     + int(ss.sort != SORTS[0])
 )
 
-with st.container(key="topbar"):
-    if show_filters:
+# Máy tính: giữ nguyên thanh "topbar" cũ. Điện thoại: thanh riêng "mtopbar" (dính trên cùng, chỉ logo + giỏ hàng + tài khoản)
+# và khối "mtools" (tìm kiếm, bộ lọc, AI, hỗ trợ) nằm ngay dưới, cuộn đi cho đỡ chiếm màn hình.
+with (contextlib.nullcontext() if IS_MOBILE else st.container(key="topbar")):
+    if IS_MOBILE:
+        _m_bar = st.container(key="mtopbar")
+        _m_tools = st.container(key="mtools")
+        with _m_bar:
+            c_brand, c_cart, c_auth = st.columns([4.2, 2.3, 2.7], vertical_alignment="center")
+        with _m_tools:
+            c_search = st.container() if show_filters else None
+            if show_filters:
+                c_flt, c_ai, c_help = st.columns(3, vertical_alignment="center")
+            else:
+                c_flt = None
+                c_ai, c_help = st.columns(2, vertical_alignment="center")
+            c_admin = st.container() if portal_page else None
+    elif show_filters:
         ratios = [2.35, 3.0, 1.0, 1.25, 1.05, 1.2, 1.3] + ([1.2] if portal_page else [])
         tb = iter(st.columns(ratios, vertical_alignment="center"))
         c_brand, c_search, c_flt, c_ai, c_help, c_cart, c_auth = (next(tb) for _ in range(7))
@@ -3612,12 +3705,12 @@ with st.container(key="topbar"):
         c_search.text_input(
             "Tìm kiếm",
             key="q",
-            placeholder="🔎 Tìm kiếm laptop theo tên, cấu hình hoặc mã SKU (VD: MacBook M5, Nitro, RTX 4060, AP-MBP14...)",
+            placeholder="🔎 Tìm laptop theo tên, cấu hình, SKU..." if IS_MOBILE else "🔎 Tìm kiếm laptop theo tên, cấu hình hoặc mã SKU (VD: MacBook M5, Nitro, RTX 4060, AP-MBP14...)",
             label_visibility="collapsed",
             on_change=go,
             args=("home",),
         )
-        with c_flt.popover(f"🎛️ Bộ lọc ({n_active})" if n_active else "🎛️ Bộ lọc", use_container_width=True):
+        with c_flt.popover((f"🎛️ Lọc ({n_active})" if n_active else "🎛️ Lọc") if IS_MOBILE else (f"🎛️ Bộ lọc ({n_active})" if n_active else "🎛️ Bộ lọc"), use_container_width=True):
             st.radio("Phân loại", ["Tất cả", "Laptop Gaming", "MacBook M5", "Văn phòng / Ultrabook"], key="category", on_change=go, args=("home",))
             st.multiselect("Hãng sản xuất", brand_options, key="brands", placeholder="Tất cả hãng", on_change=go, args=("home",))
             st.slider("Khoảng giá (triệu ₫)", 0, PRICE_MAX, key="price", on_change=go, args=("home",))
@@ -3625,13 +3718,13 @@ with st.container(key="topbar"):
             st.button("↺ Xóa bộ lọc", key="reset_f", on_click=reset_filters, use_container_width=True)
 
     if not is_staff_logged:  # nhân viên chỉ làm việc trong cổng Staff, không mua sắm / nạp tiền
-        c_ai.button("🤖 AI tư vấn", key="nav_ai", type="primary" if ss.page == "advisor" else "secondary", on_click=go, args=("advisor",), use_container_width=True)
+        c_ai.button("🤖 AI" if IS_MOBILE else "🤖 AI tư vấn", key="nav_ai", type="primary" if ss.page == "advisor" else "secondary", on_click=go, args=("advisor",), use_container_width=True)
         c_help.button("🆘 Hỗ trợ", key="nav_help", type="primary" if ss.page == "support" else "secondary", on_click=go, args=("support",), use_container_width=True)
-        c_cart.button(f"🛒 Giỏ hàng ({n_items})", key="nav_cart", on_click=go, args=("cart",), use_container_width=True)
+        c_cart.button(f"🛒 {n_items}" if IS_MOBILE else f"🛒 Giỏ hàng ({n_items})", key="nav_cart", on_click=go, args=("cart",), use_container_width=True)
 
     if ss.user:
         _parts = ss.user["fullname"].split() or [ss.user["username"]]
-        short = " ".join(_parts[-2:] if is_admin_logged else _parts[-1:])[:14]
+        short = " ".join(_parts[-2:] if is_admin_logged else _parts[-1:])[: (7 if IS_MOBILE else 14)]
         cur_bal = get_user_balance(ss.user["username"])
         with c_auth.popover(f"{'👑' if is_admin_logged else '👤'} {short}", use_container_width=True):
             if is_staff_logged:
@@ -3645,7 +3738,7 @@ with st.container(key="topbar"):
                     st.button("💳 Nạp tiền vào tài khoản", key="nav_topup", on_click=go, args=("auth",), use_container_width=True)
             st.button("🚪 Đăng xuất", key="nav_logout", on_click=logout, use_container_width=True)
     else:
-        with c_auth.popover("👤 Tài khoản", use_container_width=True):
+        with c_auth.popover("👤 Tôi" if IS_MOBILE else "👤 Tài khoản", use_container_width=True):
             st.markdown("**Chào mừng đến LAPTOP HCMUS**  \nĐăng nhập hoặc tạo tài khoản mới để mua hàng và nạp tiền.")
             st.button("🔑 Đăng nhập", key="nav_login_opt", type="primary", on_click=go, args=("auth", None, "login"), use_container_width=True)
             st.button("📝 Đăng ký tài khoản mới", key="nav_reg_opt", on_click=go, args=("auth", None, "register"), use_container_width=True)
@@ -3673,10 +3766,10 @@ def hero() -> None:
     if feat.empty and not laptops.empty:
         feat = laptops.head(1)
     art = ""
-    if not feat.empty:
+    if not feat.empty and not IS_MOBILE:  # điện thoại ẩn khối này → khỏi nhúng ảnh base64 vào trang
         art = (
             '<div class="lp-ring r2"></div><div class="lp-ring r1"></div>'
-            f'<div class="lp-art-float"><img src="{img_uri(feat.iloc[0])}" alt="Laptop nổi bật">'
+            f'<div class="lp-art-float"><img src="{img_uri(feat.iloc[0], IMG_PX_CARD)}" alt="Laptop nổi bật">'
             '<span class="lp-chip3d c1">🍎 Chip M5 mới</span>'
             '<span class="lp-chip3d c2">🎮 RTX Gaming</span>'
             '<span class="lp-chip3d c3">🎓 Ưu đãi sinh viên</span></div>'
@@ -3760,7 +3853,7 @@ def product_card(r) -> None:
         st.markdown(
             H(f"""
             <div class="lp-imgwrap">
-              <img src="{img_uri(r)}" alt="{esc(r['name'])}" loading="lazy" decoding="async">
+              <img src="{img_uri(r, IMG_PX_CARD)}" alt="{esc(r['name'])}" loading="lazy" decoding="async">
               <span class="lp-tag">{esc(r['brand'])}{gaming_tag}</span>
               <span class="lp-sku-badge">{esc(r['sku'])}</span>
             </div>
@@ -3782,6 +3875,7 @@ def set_category(cat: str) -> None:
     ss.page = "home"
 
 
+HOME_STEP_MOBILE, HOME_STEP_DESKTOP = 6, 24
 QUICK_CATS = [("Tất cả", "✨ Tất cả"), ("Laptop Gaming", "🎮 Gaming"), ("MacBook M5", "🍎 MacBook"), ("Văn phòng / Ultrabook", "💼 Văn phòng")]
 
 
@@ -3795,7 +3889,7 @@ def page_home() -> None:
     st.markdown(
         H(f"""
         <div class="lp-sechead"><h3>⚡ DANH MỤC LAPTOP</h3>
-        <small>Hiển thị {len(df)}/{len(laptops)} sản phẩm</small></div>
+        <small>Có {len(df)}/{len(laptops)} sản phẩm</small></div>
         """),
         unsafe_allow_html=True,
     )
@@ -3803,12 +3897,25 @@ def page_home() -> None:
         st.markdown('<div class="lp-empty"><h3>Không tìm thấy laptop phù hợp</h3><p style="color:#a6b8dc">Thử đổi từ khóa, phân loại hoặc khoảng giá ở bộ lọc phía trên.</p></div>', unsafe_allow_html=True)
         return
     recs = [dict(zip(df.columns, r)) for r in df.itertuples(index=False)]
-    for start in range(0, len(recs), 3):
+    # Chỉ dựng một phần sản phẩm rồi bấm "Xem thêm": mỗi thẻ nhúng một ảnh, dựng hết cùng lúc sẽ làm
+    # Safari iPhone hết bộ nhớ và tự đóng trang. Đổi bộ lọc / từ khóa thì quay về số lượng ban đầu.
+    step = HOME_STEP_MOBILE if IS_MOBILE else HOME_STEP_DESKTOP
+    sig = (ss.q.strip(), ss.category, tuple(ss.brands), tuple(ss.price), ss.sort)
+    if ss.get("_home_sig") != sig:
+        ss._home_sig = sig
+        ss.home_limit = step
+    limit = max(int(ss.get("home_limit", step)), step)
+    shown = recs[:limit]
+    for start in range(0, len(shown), 3):
         cols = st.columns(3)
-        for j, rec in enumerate(recs[start:start + 3]):
+        for j, rec in enumerate(shown[start:start + 3]):
             with cols[j]:
                 product_card(rec)
         st.write("")
+    if len(recs) > limit:
+        def _more() -> None:
+            ss.home_limit = limit + step
+        st.button(f"⬇️ Xem thêm sản phẩm (còn {len(recs) - limit})", key="home_more", on_click=_more, use_container_width=True)
 
 
 def verified_buyer(lid: int) -> bool:
@@ -3983,7 +4090,7 @@ def page_cart() -> None:
                 c1, c2, c3, c4, c5 = st.columns([4, 0.6, 0.6, 0.6, 0.6], vertical_alignment="center")
                 c1.markdown(
                     H(f"""
-                    <div class="lp-ci"><img src="{img_uri(r)}" alt=""><div>
+                    <div class="lp-ci"><img src="{img_uri(r, IMG_PX_CARD)}" alt=""><div>
                     <div style="font-weight:700;color:#f4f7ff">{esc(r['name'])} <span style="font-size:.75rem;color:#7dd3fc">[{esc(r['sku'])}]{g_tag}</span></div>
                     <div style="color:#a6b8dc;font-size:.8rem">{esc(r['cpu'])} · {esc(r['ram'])} · {esc(r['gpu'])}</div>
                     <div style="font-weight:800;color:#facc15">{vnd(r['price'])} × {q} = {vnd(int(r['price']) * q)}</div>
@@ -5339,7 +5446,7 @@ def _laptop_row_card(r, cmp_df: pd.DataFrame, why: list[str] | None = None, key:
     with st.container(key=f"adv_{key}{lid}"):
         c1, c2 = st.columns([1, 2.2], gap="large")
         with c1:
-            st.markdown(f'<img src="{img_uri(r)}" style="width:100%;border-radius:16px;object-fit:cover">', unsafe_allow_html=True)
+            st.markdown(f'<img src="{img_uri(r, IMG_PX_CARD)}" style="width:100%;border-radius:16px;object-fit:cover">', unsafe_allow_html=True)
         with c2:
             st.markdown(
                 H(f"""

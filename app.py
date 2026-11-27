@@ -614,6 +614,8 @@ def go(page: str, detail_id: int | None = None, auth_mode: str | None = None) ->
     elif page != "auth":
         ss.pop("login_return", None)
     ss.page = page
+    if page == "auth":
+        ss["_scroll_auth"] = True  # điện thoại: tự cuộn tới khung đăng nhập khi vào trang này
     if detail_id is not None:
         ss.detail_id = int(detail_id)
     if auth_mode is not None:
@@ -3600,6 +3602,7 @@ CSS_MOBILE = """
 .st-key-mtopbar button p,.st-key-mtools button p{font-size:.82rem!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 /* Khối công cụ phía dưới: cuộn đi bình thường */
 .st-key-mtools{padding:8px 4px 2px;}
+[data-testid='stForm']{scroll-margin-top:72px;}
 .st-key-mtools [data-testid='stVerticalBlock']{gap:.5rem!important;}
 .st-key-mtools input{color:#fff!important;-webkit-text-fill-color:#fff!important;}
 .st-key-mtools input::placeholder{color:#a5c0eb!important;-webkit-text-fill-color:#a5c0eb!important;}
@@ -4419,13 +4422,27 @@ def page_auth() -> None:
     if _viol:
         ss.violation = None
         render_violation(_viol)
+    if ss.pop("_scroll_auth", False) and IS_MOBILE:
+        # Cuộn tới khung đăng nhập / đăng ký (hoặc đầu trang tài khoản). Thử lại vài lần vì trang còn đang dựng.
+        _run_js(
+            "const go=function(){const f=d.querySelector(\"[data-testid='stForm']\");"
+            "if(f){f.scrollIntoView({block:'center',behavior:'auto'});}"
+            "else{const m=d.querySelector(\"[data-testid='stMain']\")||d.querySelector('section.main');"
+            "if(m){m.scrollTo(0,0);}P.scrollTo(0,0);}};"
+            "setTimeout(go,80);setTimeout(go,350);setTimeout(go,900);"
+        )
     if ss.user:
         st.title("👤 Tài khoản cá nhân")
         account_panel()
         return
 
     st.title("🔐 Tài khoản thành viên")
-    side, main = st.columns([1, 1.25], gap="large")
+    if IS_MOBILE:
+        # Điện thoại xếp cột chồng lên nhau: đưa khung đăng nhập lên trước, phần giới thiệu để xuống dưới
+        main = st.container()
+        side = st.container()
+    else:
+        side, main = st.columns([1, 1.25], gap="large")
     with side:
         st.markdown(
             H("""
